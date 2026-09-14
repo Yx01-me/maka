@@ -24,7 +24,6 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { syncBuiltinESMExports } from 'node:module';
 import { after, mock } from 'node:test';
-import { fileURLToPath } from 'node:url';
 
 const inherited = process.env.MAKA_TEST_CONTROL_HOME;
 const isolatedHome = inherited ?? (await mkdtemp(join(os.tmpdir(), 'maka-control-home-')));
@@ -32,7 +31,7 @@ const original = os.userInfo();
 mock.method(os, 'userInfo', () => ({ ...original, homedir: isolatedHome }));
 syncBuiltinESMExports();
 process.env.MAKA_TEST_CONTROL_HOME = isolatedHome;
-const preload = fileURLToPath(import.meta.url);
+const preload = import.meta.url;
 if (!process.execArgv.includes(preload)) process.execArgv.push('--import', preload);
 const previousNodeOptions = process.env.NODE_OPTIONS;
 const preloadOption = `--import=${JSON.stringify(import.meta.url)}`;
