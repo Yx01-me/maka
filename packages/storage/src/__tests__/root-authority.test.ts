@@ -465,7 +465,7 @@ describe('storage root authority', () => {
       const child = fork(
         new URL('./fixtures/root-initialization-race.js', import.meta.url),
         [root, STORAGE_ROOT_MARKER_FILE],
-        { stdio: ['ignore', 'ignore', 'ignore', 'ipc'] },
+        { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] },
       );
       try {
         await waitForChildMessage(
