@@ -596,6 +596,23 @@ export function resolveRootControlNamespace(): string {
   }
 }
 
+/** Recreates the private diagnostic parent after a failed Candidate releases its owner. */
+export async function prepareRootControlDirectoryForDiagnostic(rootId: string): Promise<string> {
+  if (!ROOT_ID_PATTERN.test(rootId)) {
+    throw new StorageRootAuthorityError('invalid_root', 'Invalid Runtime Host root identity');
+  }
+  return withAuthorityFailure(
+    'control_io_failed',
+    'Unable to prepare the Runtime Host diagnostic directory',
+    async () => {
+      const controlRoot = await preparePrivateControlRoot();
+      const controlDirectory = join(controlRoot, rootId);
+      await ensurePrivateDirectory(controlDirectory);
+      return controlDirectory;
+    },
+  );
+}
+
 /**
  * Resolves the durable namespace that owns State Root process election.
  *
@@ -1178,6 +1195,9 @@ async function quarantineRootControlDirectory(
     if (!sameFilesystemIdentity(initialDirectoryStat, currentDirectoryStat)) {
       return { kind: 'skipped' };
     }
+    if (!(await containsOnlyDisposableRootControlEntries(controlDirectory))) {
+      return { kind: 'skipped' };
+    }
     await Promise.all([
       assertStableLockArtifact(ownerHandle, join(controlDirectory, 'owner.lock')),
       assertStableLockArtifact(writerHandle, join(controlDirectory, ARTIFACT_WRITER_LOCK_FILE)),
@@ -1196,6 +1216,12 @@ async function quarantineRootControlDirectory(
         writerHandle,
         join(controlDirectory, ARTIFACT_WRITER_LOCK_FILE),
       );
+      if (!(await containsOnlyDisposableRootControlEntries(controlDirectory))) {
+        await closeReapLock(claimHandle);
+        await unlink(join(claimDirectory, ROOT_CONTROL_CLAIM_LOCK));
+        await rmdir(claimDirectory);
+        return { kind: 'skipped' };
+      }
       await rename(controlDirectory, join(claimDirectory, input.rootId));
     } catch (error) {
       await closeReapLock(claimHandle);
@@ -1215,6 +1241,33 @@ async function quarantineRootControlDirectory(
       await ownerHandle.close().catch(() => undefined);
     }
   }
+}
+
+/** Unknown entries are retained: the control directory also hosts durable Runtime Host data. */
+async function containsOnlyDisposableRootControlEntries(
+  controlDirectory: string,
+): Promise<boolean> {
+  const directory = await opendir(controlDirectory);
+  try {
+    for await (const entry of directory) {
+      if (!isDisposableRootControlEntry(entry.name)) return false;
+    }
+    return true;
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
+}
+
+function isDisposableRootControlEntry(name: string): boolean {
+  return (
+    name === 'owner.lock' ||
+    name === ARTIFACT_WRITER_LOCK_FILE ||
+    name === 'registration.json' ||
+    name === 'bundle-imports-v1' ||
+    /^registration\.json\.\d+\.[0-9a-f-]{36}\.tmp$/u.test(name) ||
+    /^startup-diagnostic(?:\.[0-9a-f-]{36})?\.json(?:\.\d+\.[0-9a-f-]{36}\.tmp)?$/u.test(name) ||
+    /^runtime-host-access-delivery-[0-9a-f-]{36}\.json$/u.test(name)
+  );
 }
 
 async function createRootControlReapClaim(controlRoot: string): Promise<string> {

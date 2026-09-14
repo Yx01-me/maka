@@ -39,7 +39,7 @@ owners:
 
 ## 1. 结论与主要不变量
 
-`runtime-hosts/<rootId>` 是可丢弃的控制面目录。write owner 正常关闭时尝试立即回收；进程崩溃留下的目录由后续 Host ready 后的后台 reaper 分批回收。
+`runtime-hosts/<rootId>` 同时保存临时控制文件和持久的访问、插件状态。只有顶层条目全部属于已知临时文件时，write owner 正常关闭或后续 Host 的后台 reaper 才隔离并回收整个目录；存在持久或未知条目时保留目录。
 
 实现必须保持以下不变量：
 
@@ -50,6 +50,7 @@ owners:
 5. 正常关闭中的控制目录清理是 best effort；清理失败不能阻止 compatibility owner lock 和 durable owner lock 的释放。
 6. reaper 不被 Host ready 等待，且单轮使用有界、流式、顺序扫描。
 7. `state-root-owners/<rootId>.lock` 不创建、不 rename、不删除，现有 durable 选主模型保持不变。
+8. 目录中出现任何非已知临时条目时禁止整目录 quarantine，避免把访问凭据或插件状态当作缓存删除。
 
 ## 2. 被回收的对象是什么
 
@@ -61,12 +62,16 @@ State Root 和 Runtime Host 控制目录不是同一个对象：
   ...                           # Session、Runtime、Artifact 等持久数据
 
 <cache>/maka/runtime-hosts/
-  <rootId>/                     # 本文负责回收的可丢弃控制目录
+  <rootId>/                     # 混合目录，仅全为已知临时条目时回收
     owner.lock                  # Host/Root Reader compatibility lock
     .maka-artifact-writer.lock  # 独立 Artifact Writer lock
     registration.json
     diagnostics...
-    plugin cache...
+    runtime-host-access.json    # 持久凭据、授权与撤销状态
+    plugin-composition-v2.json  # 持久插件组合
+    plugin-packages-v2/         # 持久可信插件包
+    plugin-generations-v1/      # 持久插件代际
+    plugin-data/                # 持久插件数据
   .reap/
     <claimUuid>/
       .claim.lock              # 清理者之间互斥，rename 前即持有
@@ -78,7 +83,7 @@ State Root 和 Runtime Host 控制目录不是同一个对象：
 
 不同平台上的 `<cache>` 和 `<durable-data>` 由 `resolveRootControlNamespace()` 与 `resolveRootOwnershipNamespace()` 决定。本文不依赖它们的具体绝对路径。
 
-控制目录中的 registration、diagnostics、plugin cache 和锁文件作为整体删除。这不会删除 State Root，也不会归档或删除用户会话。
+`registration.json`、启动诊断、凭据传递文件、`bundle-imports-v1/` 和两个锁是已知临时条目。当前实现只有在目录完全由这些条目构成时才整目录删除；否则保留整个目录，包括其中的临时文件。这个保守边界保护现存与未来未识别的持久状态，但仍需后续把临时文件迁入独立子目录，才能完整回收混合目录中的残留控制文件。
 
 ## 3. 为什么需要两个锁
 
@@ -107,10 +112,11 @@ validate <rootId> direct child
   -> exclusively lock owner.lock without waiting
   -> exclusively lock .maka-artifact-writer.lock without waiting
   -> revalidate directory dev/ino
+  -> confirm every top-level entry is disposable
   -> revalidate both lock handle/path identities
   -> mkdir runtime-hosts/.reap/<claimUuid>
   -> exclusively lock claim/.claim.lock
-  -> revalidate source directory and both locks again
+  -> revalidate source directory, both locks and disposable entries again
   -> rename <rootId> to .reap/<claimUuid>/<rootId>
   -> release and close acquired locks
   -> stream deletion of <claimUuid> while holding claim lock
@@ -124,6 +130,7 @@ validate <rootId> direct child
 - 目录在获取锁前后的 `dev/ino` 必须相同；
 - 两个锁都必须是 handle 与当前路径指向同一 `dev/ino` 的普通文件；
 - 缺失的锁文件允许以私有权限创建，然后立即尝试非阻塞排他锁；
+- 任何未知顶层文件或目录都使本轮跳过，不会进入 claim 删除；
 - claim 使用 UUID v4；`mkdir` 遇到 `EEXIST` 时重新生成，最多尝试 3 次。
 
 ### 4.2 rename 后的名字
@@ -185,7 +192,7 @@ sequenceDiagram
     Host->>Q: 复用已持有 owner.lock，尝试获取 Writer lock
     alt quarantine 成功
         Q->>Q: rename 到 .reap/uuid/rootId
-    else busy、identity 变化或文件系统失败
+    else busy、含持久状态、identity 变化或文件系统失败
         Q-->>Host: 跳过清理
     end
     Host->>Locks: 释放并关闭 compatibility owner lock
@@ -195,7 +202,9 @@ sequenceDiagram
 
 清理异常被隔离在 shutdown 的 best-effort 分支内。原有锁关闭错误仍然按照既有行为聚合并报告，不能被目录清理错误掩盖。
 
-正常关闭的 tombstone 删除同样受 1,024 个工作事件 / 500ms 协作式预算限制。超过预算时释放 claim lock，保留部分 tombstone，后续回收继续处理。原始 `<rootId>` 已经移走，不需要等待整个缓存树删除完毕。quarantine 失败或 Writer 活跃时，原目录仍可能保留，因此“正常关闭不留目录”是成功隔离情况下的结果，不是无条件保证。
+Candidate 在取得 owner 后启动失败时，owner 可能先清除只有临时条目的目录。随后启动诊断写入会验证 rootId，并重建私有的诊断父目录，避免因 `ENOENT` 丢失失败原因。
+
+正常关闭的 tombstone 删除同样受 1,024 个工作事件 / 500ms 协作式预算限制。超过预算时释放 claim lock，保留部分 tombstone，后续回收继续处理。成功隔离后原始 `<rootId>` 已经移走。包含持久状态或未知条目、quarantine 失败或 Writer 活跃时，原目录会保留。
 
 shared Root Reader 的 `close()` 只释放 reader lock，不主动回收目录。原因是 reader close 没有必要把正常 shutdown 变成目录所有权转移；空闲目录会由后续 reaper 使用相同双锁协议处理。
 
@@ -238,6 +247,7 @@ shared Root Reader 的 `close()` 只释放 reader lock，不主动回收目录�
 | reaper 与活跃 Host | reaper 无法排他获取 `owner.lock`，目录保留 |
 | reaper 与 shared Reader | shared lock 阻止 reaper 的排他 owner lock，目录保留 |
 | reaper 与独立 Artifact Writer | Writer lock 冲突，目录保留 |
+| 目录含访问凭据、插件数据或未知条目 | 跳过整目录 quarantine，目录及其内容保留 |
 | 两个跨进程 reaper 处理同一目录 | 最多一个取得双锁并 rename；另一个得到 contention、identity 变化或 `ENOENT` |
 | rename 后新 Host 重建 `<rootId>` | 新 Host 使用新目录；旧 reaper 只删除 claim |
 | 竞争者已打开旧 inode | 竞争者的 stable-path 校验发现路径 identity 改变并拒绝继续 |
@@ -416,7 +426,7 @@ interface RootControlDirectoryReapSummary {
 
 Review 时建议优先确认：
 
-1. `runtime-hosts/<rootId>` 中是否还存在未受两个锁之一保护的长期使用者；如果存在，当前双锁不变量不完整。
+1. `runtime-hosts/<rootId>` 中是否还有持久或未知条目；当前策略会保留整目录，后续应隔离临时控制文件以继续回收。
 2. 原生 Windows“安全但不回收”是否可以接受；如果不可接受，本方案需要新的 Windows 锁/rename primitive，而不是放宽失败策略。
 3. 24 小时 grace、1,024 entry 和 500ms 协作式预算是否符合实际控制目录增长速度。
 4. 正常关闭最多一个协作式删除批次是否符合退出延迟要求；慢文件系统调用仍可超时。
@@ -426,7 +436,7 @@ Review 时建议优先确认：
 
 - 新增不持有 `owner.lock` 或 Writer lock 的控制目录使用者；
 - 实际观测到持续超过预算、目录回收速度低于增长速度；
-- 控制目录开始保存不可丢弃数据；
+- 临时文件与持久状态完成目录拆分，需要调整当前保守的整目录准入规则；
 - 原生 Windows 必须提供与 POSIX 相同的回收保证；
 - 单个 tombstone 的递归删除经常显著超过时间预算；
 - 需要跨进程退出保持公平扫描游标；目前游标仅在一次后台 sweep 内保留。

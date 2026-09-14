@@ -850,12 +850,41 @@ describe('storage root authority', () => {
       const owner = await tryAcquireInteractiveRootOwner(capability);
       assert.ok(owner);
       if (!owner) return;
-      await writeFile(join(owner.controlDirectory, 'diagnostic.json'), '{}\n');
+      await writeFile(join(owner.controlDirectory, 'startup-diagnostic.json'), '{}\n');
 
       await owner.close();
 
       await assert.rejects(lstat(owner.controlDirectory), { code: 'ENOENT' });
       assert.equal((await lstat(owner.lockPath)).isFile(), true);
+    });
+  });
+
+  test('preserves durable access and plugin state on close and during a later sweep', async () => {
+    await withRoots(async ({ root }) => {
+      const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
+      const owner = await tryAcquireInteractiveRootOwner(capability);
+      assert.ok(owner);
+      if (!owner) return;
+      const accessPath = join(owner.controlDirectory, 'runtime-host-access.json');
+      const compositionPath = join(owner.controlDirectory, 'plugin-composition-v2.json');
+      const packagesPath = join(owner.controlDirectory, 'plugin-packages-v2');
+      const futureStatePath = join(owner.controlDirectory, 'future-state.bin');
+      await writeFile(accessPath, 'access state');
+      await writeFile(compositionPath, 'plugin composition');
+      await writeFile(futureStatePath, 'future state');
+      await mkdir(packagesPath);
+      await writeFile(join(packagesPath, 'package'), 'trusted package');
+
+      await owner.close();
+      await reapStaleRootControlDirectories({ graceMs: 0, maxEntries: 100_000 });
+
+      assert.equal(await readFile(accessPath, 'utf8'), 'access state');
+      assert.equal(await readFile(compositionPath, 'utf8'), 'plugin composition');
+      assert.equal(await readFile(join(packagesPath, 'package'), 'utf8'), 'trusted package');
+      assert.equal(await readFile(futureStatePath, 'utf8'), 'future state');
+      const successor = await tryAcquireInteractiveRootOwner(capability);
+      assert.ok(successor);
+      await successor?.close();
     });
   });
 
@@ -927,9 +956,9 @@ describe('storage root authority', () => {
       const staleCapability = await resolveStorageRoot({ path: root, kind: 'interactive' });
       const { controlDirectory: staleDirectory } =
         await prepareStorageRootControlDirectory(staleCapability);
-      await mkdir(join(staleDirectory, 'plugins'));
+      await mkdir(join(staleDirectory, 'bundle-imports-v1'));
       await writeFile(join(staleDirectory, 'registration.json'), '{}\n');
-      await writeFile(join(staleDirectory, 'plugins', 'cache.json'), '{}\n');
+      await writeFile(join(staleDirectory, 'bundle-imports-v1', 'cache.json'), '{}\n');
       const old = new Date(Date.now() - 48 * 60 * 60 * 1_000);
       await utimes(staleDirectory, old, old);
 
@@ -1136,7 +1165,7 @@ describe('storage root authority', () => {
     await withRoots(async ({ root }) => {
       const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
       const { controlDirectory } = await prepareStorageRootControlDirectory(capability);
-      await writeFile(join(controlDirectory, 'old-payload'), 'old');
+      await writeFile(join(controlDirectory, 'registration.json'), 'old');
       const child = fork(
         new URL('./fixtures/root-control-reaper.js', import.meta.url),
         [controlDirectory],
@@ -1167,7 +1196,7 @@ describe('storage root authority', () => {
             resolve(value.destination);
           });
         });
-        assert.equal(await readFile(join(tombstone, 'old-payload'), 'utf8'), 'old');
+        assert.equal(await readFile(join(tombstone, 'registration.json'), 'utf8'), 'old');
         await assert.rejects(lstat(controlDirectory), { code: 'ENOENT' });
         owner = await tryAcquireInteractiveRootOwner(capability);
         assert.ok(owner);
@@ -1324,7 +1353,7 @@ describe('storage root authority', () => {
     await withRoots(async ({ root }) => {
       const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
       const { controlDirectory } = await prepareStorageRootControlDirectory(capability);
-      await writeFile(join(controlDirectory, 'old-cache'), 'old');
+      await writeFile(join(controlDirectory, 'registration.json'), 'old');
       const originalRename = filesystem.rename;
       let successor: Awaited<ReturnType<typeof tryAcquireInteractiveRootOwner>>;
       context.mock.method(
@@ -1345,7 +1374,9 @@ describe('storage root authority', () => {
         }
         assert.ok(successor);
         assert.equal(await readFile(join(controlDirectory, 'new-cache'), 'utf8'), 'new');
-        await assert.rejects(lstat(join(controlDirectory, 'old-cache')), { code: 'ENOENT' });
+        await assert.rejects(lstat(join(controlDirectory, 'registration.json')), {
+          code: 'ENOENT',
+        });
       } finally {
         context.mock.restoreAll();
         syncBuiltinESMExports();
@@ -1360,7 +1391,7 @@ describe('storage root authority', () => {
     await withRoots(async ({ root }) => {
       const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
       const { controlDirectory } = await prepareStorageRootControlDirectory(capability);
-      await writeFile(join(controlDirectory, 'keep'), 'original');
+      await writeFile(join(controlDirectory, 'registration.json'), 'original');
       const originalMkdir = filesystem.mkdir;
       let replaced = false;
       context.mock.method(
@@ -1381,7 +1412,10 @@ describe('storage root authority', () => {
         for await (const _batch of reapRootControlDirectoryBatches({ graceMs: 0 })) {
         }
         assert.equal(replaced, true);
-        assert.equal(await readFile(join(controlDirectory, 'keep'), 'utf8'), 'original');
+        assert.equal(
+          await readFile(join(controlDirectory, 'registration.json'), 'utf8'),
+          'original',
+        );
       } finally {
         context.mock.restoreAll();
         syncBuiltinESMExports();
