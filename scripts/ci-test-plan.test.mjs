@@ -55,6 +55,7 @@ const dirs = [
   'packages/cli',
   'packages/ui',
   'apps/desktop',
+  'website',
 ];
 
 const graph = {
@@ -67,6 +68,7 @@ const graph = {
     ['packages/cli', new Set()],
     ['packages/ui', new Set(['apps/desktop'])],
     ['apps/desktop', new Set()],
+    ['website', new Set()],
   ]),
   testDirs: new Set(dirs),
 };
@@ -87,6 +89,15 @@ test('documentation inside workspaces selects nothing at all', () => {
   }
 });
 
+test('the READMEs run the website tests that check their opening sentence', () => {
+  for (const path of ['README.md', 'README.zh-CN.md']) {
+    const plan = planTests([path], { graph });
+
+    assert.equal(plan.code, true, path);
+    assert.deepEqual(plan.workspaces, ['website'], path);
+  }
+});
+
 test('mixed documentation and code changes still select code validation', () => {
   const plan = planTests(['README.md', 'packages/core/src/index.ts'], { graph });
 
@@ -104,6 +115,19 @@ test('documentation with a dedicated contract still selects that contract', () =
     assert.equal(plan.code, false, path);
     assert.notDeepEqual(selections(plan), [], path);
   }
+});
+
+test('DeepSeek Harness toolchain inputs rebuild its pinned fingerprint', () => {
+  for (const path of [
+    'packages/eval/harbor/deepseek-harness-toolchain/package.json',
+    'packages/eval/harbor/deepseek-harness-toolchain/package-lock.json',
+    'packages/eval/harbor/deepseek-harness-toolchain/patch-subprocess-local.mjs',
+    'packages/eval/src/toolchain-verification.ts',
+    'scripts/prepare-deepseek-harness-toolchain.mjs',
+  ]) {
+    assert.equal(planTests([path], { graph }).deepseekHarnessToolchain, true, path);
+  }
+  assert.equal(planTests(['packages/eval/README.md'], { graph }).deepseekHarnessToolchain, false);
 });
 
 test('changed files are derived from the PR merge base', () => {
@@ -223,6 +247,7 @@ test('release authority changes select their dedicated contract gate', () => {
     '.github/workflows/release-cli-finalize.yml',
     '.github/workflows/release-cli-stage.yml',
     '.github/workflows/release.yml',
+    'scripts/audit-shipped-dependencies.mjs',
     'scripts/package-macos.mjs',
     'scripts/package-macos-autoupdate-next.mjs',
     'scripts/package-macos-arm64-cli.mjs',
@@ -477,6 +502,12 @@ test('a durable-state decoder selects the released forward roll', () => {
   const plan = planTests(['packages/runtime-host/src/server/access-credential-store.ts'], {
     graph,
   });
+
+  assert.equal(plan.stateRootCompat, true);
+});
+
+test('a core durable-state decoder selects the released forward roll', () => {
+  const plan = planTests(['packages/core/src/goal.ts'], { graph });
 
   assert.equal(plan.stateRootCompat, true);
 });

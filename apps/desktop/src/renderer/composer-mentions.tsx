@@ -56,7 +56,7 @@ export interface ComposerMentions {
 
 /** Which backend surface the popups should describe. */
 export interface ComposerMentionsSurface {
-  /** Invalidates Runtime's invocable projection after installed Skills settle. */
+  /** Handed over by the Module Hub boundary to invalidate Runtime's projection. */
   skillCatalogRevision: number;
   sessionId?: string;
   projectPath?: string;
@@ -65,6 +65,12 @@ export interface ComposerMentionsSurface {
   newSessionPermissionMode?: ChatDefaultPermissionMode;
   newTaskTarget?: DesktopNewTaskTarget;
 }
+
+/** The surface AppShell assembles; the Module Hub boundary supplies the revision. */
+export type ComposerMentionsSurfaceInput = Omit<
+  ComposerMentionsSurface,
+  'skillCatalogRevision'
+>;
 
 /**
  * Owns the composer mention popup wiring so app-shell.tsx keeps no inline
@@ -84,6 +90,15 @@ function useComposerMentions(options: ComposerMentionsSurface): ComposerMentions
     newSessionPermissionMode,
     newTaskTarget,
   } = options;
+  // Once a session exists, Runtime resolves its Skill projection from the
+  // session identity alone. AppShell can learn the session's project path (or
+  // update the defaults for a future task) on a later render; those new-task
+  // inputs must not turn the current session into a different catalog surface.
+  const newTaskProjectPath = sessionId ? undefined : projectPath;
+  const newTaskModel = sessionId ? undefined : newSessionModel;
+  const newTaskCollaborationMode = sessionId ? undefined : newSessionCollaborationMode;
+  const newTaskPermissionMode = sessionId ? undefined : newSessionPermissionMode;
+  const activeNewTaskTarget = sessionId ? undefined : newTaskTarget;
   // One explicit representation of the Skill catalog — in flight, settled
   // empty, or settled populated — held as a single value so a refresh can
   // never tear its facets apart.
@@ -106,17 +121,19 @@ function useComposerMentions(options: ComposerMentionsSurface): ComposerMentions
   // still on screen for the new one. Deriving through the key below makes the
   // render itself fail closed the moment the context changes, without waiting
   // for the effect.
-  const contextKey = [
-    sessionId ?? '',
-    projectPath ?? '',
-    newSessionModel?.llmConnectionSlug ?? '',
-    newSessionModel?.model ?? '',
-    newSessionCollaborationMode ?? 'agent',
-    newSessionPermissionMode ?? '',
-    newTaskTarget?.profileId ?? '',
-    newTaskTarget?.hostId ?? '',
-    newTaskTarget?.projectId ?? '',
-  ].join('\u0000');
+  const contextKey = sessionId
+    ? ['session', sessionId].join('\u0000')
+    : [
+        'new-task',
+        newTaskProjectPath ?? '',
+        newTaskModel?.llmConnectionSlug ?? '',
+        newTaskModel?.model ?? '',
+        newTaskCollaborationMode ?? 'agent',
+        newTaskPermissionMode ?? '',
+        activeNewTaskTarget?.profileId ?? '',
+        activeNewTaskTarget?.hostId ?? '',
+        activeNewTaskTarget?.projectId ?? '',
+      ].join('\u0000');
   const [catalog, setCatalog] = useState<{
     contextKey: string;
     loading: boolean;
@@ -148,16 +165,16 @@ function useComposerMentions(options: ComposerMentionsSurface): ComposerMentions
             { contextKey, loading: true, settled: undefined, skills: EMPTY_SKILLS },
       );
       const context = {
-        ...(newSessionModel ?? {}),
-        collaborationMode: newSessionCollaborationMode ?? 'agent',
-        ...(newSessionPermissionMode
-          ? { permissionMode: newSessionPermissionMode }
+        ...(newTaskModel ?? {}),
+        collaborationMode: newTaskCollaborationMode ?? 'agent',
+        ...(newTaskPermissionMode
+          ? { permissionMode: newTaskPermissionMode }
           : {}),
       } as const;
       const request = sessionId
         ? window.maka.skills.listInvocable(sessionId)
-        : newTaskTarget
-          ? window.maka.newTasks.listInvocableSkills(newTaskTarget, context)
+        : activeNewTaskTarget
+          ? window.maka.newTasks.listInvocableSkills(activeNewTaskTarget, context)
           : Promise.resolve([]);
       void request.then(
         (next) => {
@@ -207,16 +224,16 @@ function useComposerMentions(options: ComposerMentionsSurface): ComposerMentions
       unsubscribeContext();
     };
   }, [
-    projectPath,
+    newTaskProjectPath,
     sessionId,
     skillCatalogRevision,
-    newSessionModel?.llmConnectionSlug,
-    newSessionModel?.model,
-    newSessionCollaborationMode,
-    newSessionPermissionMode,
-    newTaskTarget?.profileId,
-    newTaskTarget?.hostId,
-    newTaskTarget?.projectId,
+    newTaskModel?.llmConnectionSlug,
+    newTaskModel?.model,
+    newTaskCollaborationMode,
+    newTaskPermissionMode,
+    activeNewTaskTarget?.profileId,
+    activeNewTaskTarget?.hostId,
+    activeNewTaskTarget?.projectId,
   ]);
 
   const searchMentionFiles = useCallback(
@@ -224,8 +241,8 @@ function useComposerMentions(options: ComposerMentionsSurface): ComposerMentions
       try {
         const result = sessionId
           ? await window.maka.workspace.searchFiles(query, { sessionId })
-          : newTaskTarget
-            ? await window.maka.newTasks.searchFiles(newTaskTarget, query)
+          : activeNewTaskTarget
+            ? await window.maka.newTasks.searchFiles(activeNewTaskTarget, query)
             : { ok: false as const, reason: 'no_project' as const };
         return result.ok ? result.files : [];
       } catch {
@@ -236,9 +253,9 @@ function useComposerMentions(options: ComposerMentionsSurface): ComposerMentions
     },
     [
       sessionId,
-      newTaskTarget?.profileId,
-      newTaskTarget?.hostId,
-      newTaskTarget?.projectId,
+      activeNewTaskTarget?.profileId,
+      activeNewTaskTarget?.hostId,
+      activeNewTaskTarget?.projectId,
     ],
   );
 
@@ -294,6 +311,22 @@ export function ComposerMentionsProvider({
     [mentionSkills, mentionSkillsUnavailable, mentionSkillsLoading, searchMentionFiles],
   );
   return <ComposerMentionsContext.Provider value={value}>{children}</ComposerMentionsContext.Provider>;
+}
+
+/**
+ * How the provider mounts under the Skill catalog revision the Module Hub
+ * boundary hands over: the shell passes the surface it assembled, the boundary
+ * supplies the revision and the frame it already built, and the provider's
+ * `skillCatalogRevision` stays a required, compiler-checked prop.
+ */
+export function renderComposerMentionsProvider(
+  surface: ComposerMentionsSurfaceInput,
+): (skillCatalogRevision: number, children: ReactNode) => ReactNode {
+  return (skillCatalogRevision, children) => (
+    <ComposerMentionsProvider {...surface} skillCatalogRevision={skillCatalogRevision}>
+      {children}
+    </ComposerMentionsProvider>
+  );
 }
 
 export function useComposerMentionsContext(): ComposerMentions | undefined {

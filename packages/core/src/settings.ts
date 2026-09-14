@@ -40,6 +40,7 @@ import type { UsageProvenance } from './usage-ledger-merge.js';
 import {
   UI_LOCALE_PREFERENCES,
   isUiLocalePreference,
+  normalizeUiLocalePreference,
   type UiLocalePreference,
 } from './ui-locale.js';
 import { normalizeSubagentSettings, type SubagentSettings } from './subagent-settings.js';
@@ -75,6 +76,7 @@ export const SETTINGS_SECTIONS = [
   'daily-review',
   'models',
   'subagents',
+  'external-agents',
   'usage',
   // `maka://settings/<section>` is a public deep link, so the id names what
   // the page is rather than the noun it lives under.
@@ -509,6 +511,8 @@ export function isChatDefaultPermissionMode(value: unknown): value is ChatDefaul
 /** Seeds new sessions' starting permission mode (Settings → 通用 → 默认权限模式). */
 export interface ChatDefaultsSettings {
   permissionMode: ChatDefaultPermissionMode;
+  /** Applies only when a new task is created. */
+  codeModeEnabled?: boolean;
   /**
    * Seeds new sessions' thinking level. `undefined` means "whatever the model
    * does on its own" — the absence of a preference, not a level.
@@ -583,6 +587,7 @@ export interface AppSettings {
   notifications: NotificationSettings;
   workHub: WorkHubSettings;
   system: SystemSettings;
+  externalAgents: { antigravity: { executable: string } };
   shell: ShellSettings;
   subagents: SubagentSettings;
 }
@@ -691,6 +696,14 @@ export type SettingsTestResultCode =
   | 'bot_token_missing'
   | 'bot_token_invalid'
   | 'bot_app_credentials_missing'
+  | 'slack_tokens_missing'
+  | 'wecom_credentials_missing'
+  | 'dingtalk_credentials_missing'
+  | 'dingtalk_no_access_token'
+  | 'qq_credentials_missing'
+  | 'qq_no_access_token'
+  | 'wechat_bridge_url_invalid'
+  | 'wechat_ilink_credentials_incomplete'
   | 'bot_connection_failed';
 
 export type UpdateAppSettingsInput = Partial<{
@@ -709,10 +722,16 @@ export type UpdateAppSettingsInput = Partial<{
   notifications: Partial<NotificationSettings>;
   workHub: Partial<WorkHubSettings>;
   system: Partial<SystemSettings>;
+  externalAgents: AppSettings['externalAgents'];
   shell: Partial<ShellSettings>;
   webSearch: WebSearchSettingsPatch;
   subagents: SubagentSettings;
 }>;
+
+/** Preconditions for a Host-owned Settings write that must not be retried past a semantic change. */
+export interface RuntimeHostSettingsUpdateGuard {
+  readonly expectedExternalAgentExecutable?: string;
+}
 
 export type PersonalizationSettingsWarning =
   | 'override-attempt'
@@ -795,6 +814,7 @@ export function createDefaultSettings(): AppSettings {
       // battery-affecting opt-in, not a silent default.
       keepSystemAwake: false,
     },
+    externalAgents: { antigravity: { executable: '' } },
     shell: {
       preference: 'auto',
       executable: '',
@@ -883,6 +903,7 @@ export function mergeSettings(current: AppSettings, patch: UpdateAppSettingsInpu
       ...current.system,
       ...(patch.system ?? {}),
     },
+    externalAgents: patch.externalAgents ?? current.externalAgents,
     shell: {
       ...current.shell,
       ...(patch.shell ?? {}),
@@ -914,6 +935,7 @@ export function normalizeSettings(input: unknown): AppSettings {
     notifications: value.notifications,
     workHub: value.workHub,
     system: value.system,
+    externalAgents: value.externalAgents,
     shell: value.shell,
     subagents: value.subagents,
   });
@@ -978,13 +1000,12 @@ export function normalizeSettings(input: unknown): AppSettings {
     // PR-LANG-PREF-0: closed-enum fail-closed for the new
     // `personalization.uiLocale` preference. mergeSettings spreads
     // raw user values, so an unknown value would otherwise reach the
-    // renderer outside the closed reactive-locale contract. Fall back to
-    // 'auto' on any miss.
+    // renderer outside the closed reactive-locale contract. Preserve the
+    // former generic `zh` preference as Simplified Chinese, then fall back to
+    // 'auto' on any other miss.
     personalization: {
       ...base.personalization,
-      uiLocale: isUiLocalePreference(base.personalization.uiLocale)
-        ? base.personalization.uiLocale
-        : 'auto',
+      uiLocale: normalizeUiLocalePreference(base.personalization.uiLocale),
       selectedPetId: normalizeSelectedPetId(base.personalization.selectedPetId),
     },
     botChat: normalizeBotChatSettings(base.botChat, value.botChat),
@@ -1018,6 +1039,14 @@ export function normalizeSettings(input: unknown): AppSettings {
     system: {
       keepSystemAwake:
         typeof base.system.keepSystemAwake === 'boolean' ? base.system.keepSystemAwake : false,
+    },
+    externalAgents: {
+      antigravity: {
+        executable:
+          typeof base.externalAgents?.antigravity?.executable === 'string'
+            ? base.externalAgents.antigravity.executable
+            : '',
+      },
     },
     shell: normalizeShellSettings(base.shell),
     subagents: normalizeSubagentSettings(base.subagents),
@@ -1065,6 +1094,7 @@ function defaultChatDefaultsSettings(): ChatDefaultsSettings {
 // doesn't recognize -- fall back to the safest default instead.
 function normalizeChatDefaultsSettings(settings: ChatDefaultsSettings): ChatDefaultsSettings {
   return {
+    ...(settings.codeModeEnabled === true ? { codeModeEnabled: true } : {}),
     // Same fail-closed reasoning as the mode below: a garbage persisted level
     // drops to "no preference" (the model's own default) rather than reaching
     // session creation as a rung no picker recognizes.

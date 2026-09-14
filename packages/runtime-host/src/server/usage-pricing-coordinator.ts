@@ -17,6 +17,8 @@
  * under the License.
  */
 
+import { JsonArrayPageBudget } from './json-array-page-budget.js';
+
 import { createHash } from 'node:crypto';
 import type {
   PricingConfig,
@@ -62,7 +64,11 @@ import {
 } from '../protocol/index.js';
 import type { UsagePricingOperationHandlerMap } from './operation-dispatcher.js';
 import { RuntimePolicyActivationGate } from './runtime-policy-activation-gate.js';
-import { readCanonicalUsage } from './canonical-usage-reader.js';
+import {
+  readCanonicalUsageBuckets,
+  readCanonicalUsageLogs,
+  readCanonicalUsageSummary,
+} from './canonical-usage-reader.js';
 
 /** Root-scoped projection over the authentic lease-bound usage stores. */
 export class HostUsagePricingCoordinator {
@@ -125,32 +131,33 @@ export class HostUsagePricingCoordinator {
     return titles;
   }
 
-  /**
-   * Reads the canonical ledger for the window a query addresses (#1679). The
-   * range is resolved once here so both sources answer the same window.
-   */
-  async #canonicalUsage(
-    query: UsageQuery,
-    now: number,
-    repair = true,
-  ): Promise<CanonicalUsageSource> {
-    return readCanonicalUsage(this.#stores, query, now, repair);
-  }
-
   async #queryUsage(input: UsageQueryInput): Promise<OperationOutcome<'usage.query'>> {
     try {
       const now = Date.now();
       if (input.kind === 'summary') {
         const merged = mergeUsageSummary(
           await this.#stores.telemetry.summary(input.query),
-          await this.#canonicalUsage(input.query, now),
-          input.query,
-          now,
+          await readCanonicalUsageSummary(this.#stores, input.query, now),
         );
+        // Tool executions are in their own ledger, not the model-call one, so
+        // their totals ride beside the merged summary rather than inside it —
+        // the same owner split the tool buckets path already follows. A
+        // connection-scoped query is refused instead of answered: tool rows
+        // that predate connection attribution cannot be scoped, and a ring
+        // built from an unscoped subset would quietly contradict the model
+        // totals beside it.
         const { provenance, ...summary } = merged;
+        const toolUsage =
+          input.query.connectionSlug === undefined
+            ? await this.#stores.telemetry.toolSummary(input.query)
+            : undefined;
         return {
           ok: true,
-          result: encodeUsageQueryResult({ kind: 'summary', summary, provenance }),
+          result: encodeUsageQueryResult({
+            kind: 'summary',
+            summary: { ...summary, toolUsage },
+            provenance,
+          }),
         };
       }
       if (input.kind === 'buckets') {
@@ -165,10 +172,13 @@ export class HostUsagePricingCoordinator {
             : mergeUsageBuckets(
                 legacy,
                 // Only the first page repairs; later pages reuse it.
-                await this.#canonicalUsage(input.query, now, offset === 0),
-                input.query,
-                input.groupBy,
-                now,
+                await readCanonicalUsageBuckets(
+                  this.#stores,
+                  input.query,
+                  input.groupBy,
+                  now,
+                  offset === 0,
+                ),
               );
         if (offset > merged.buckets.length) return invalidUsageOffset();
         return {
@@ -210,9 +220,7 @@ export class HostUsagePricingCoordinator {
       const merged = mergeUsageLogs(
         legacy,
         // Only the first page repairs; later pages reuse it.
-        await this.#canonicalUsage(input.query, now, offset === 0),
-        input.query,
-        now,
+        await readCanonicalUsageLogs(this.#stores, input.query, now, offset + limit, offset === 0),
         offset,
         limit,
       );
@@ -411,20 +419,19 @@ function createPricingPage(
   offset: number,
 ): PricingQueryResult {
   const items: EffectivePricingEntry[] = [];
+  const budget = new JsonArrayPageBudget(PRICING_PAGE_MAX_BYTES, {
+    kind: 'page',
+    revision,
+    offset,
+    entries: [],
+    nextOffset: null,
+  });
   for (let index = offset; index < entries.length; index += 1) {
     if (items.length >= PRICING_PAGE_MAX_ITEMS) break;
     const item = entries[index];
     if (!item) break;
-    const candidate = [...items, item];
-    const nextOffset = offset + candidate.length;
-    const page: PricingQueryResult = {
-      kind: 'page',
-      revision,
-      offset,
-      entries: candidate,
-      nextOffset: nextOffset < entries.length ? nextOffset : null,
-    };
-    if (jsonBytes(page) > PRICING_PAGE_MAX_BYTES) {
+    const nextOffset = offset + items.length + 1;
+    if (!budget.tryAppend(item, nextOffset < entries.length ? nextOffset : null)) {
       if (items.length === 0) {
         throw new Error('Canonical pricing entry exceeds the wire page limit');
       }
@@ -472,20 +479,13 @@ function usagePage(
 ): Extract<UsageQueryResult, { kind: 'buckets' }> {
   const source = allItems.slice(offset, offset + limit);
   const items: UsageBucket[] = [];
+  const budget = new JsonArrayPageBudget(
+    USAGE_PAGE_MAX_BYTES,
+    bucketPageResult([], total, offset, null, provenance),
+  );
   for (const item of source) {
-    const candidate = [...items, item];
-    const nextOffset = offset + candidate.length;
-    if (
-      jsonBytes(
-        bucketPageResult(
-          candidate,
-          total,
-          offset,
-          nextOffset < total ? nextOffset : null,
-          provenance,
-        ),
-      ) > USAGE_PAGE_MAX_BYTES
-    ) {
+    const nextOffset = offset + items.length + 1;
+    if (!budget.tryAppend(item, nextOffset < total ? nextOffset : null)) {
       break;
     }
     items.push(item);
@@ -531,21 +531,13 @@ function usageLogPage(
   provenance?: UsageProvenance,
 ): Extract<UsageQueryResult, { kind: 'logs' }> {
   const items: UsageLogProjection[] = [];
+  const budget = new JsonArrayPageBudget(
+    USAGE_PAGE_MAX_BYTES,
+    logPageResult(source, [], total, offset, null, provenance),
+  );
   for (const item of allItems.slice(0, limit)) {
-    const candidate = [...items, item];
-    const nextOffset = offset + candidate.length;
-    if (
-      jsonBytes(
-        logPageResult(
-          source,
-          candidate,
-          total,
-          offset,
-          nextOffset < total ? nextOffset : null,
-          provenance,
-        ),
-      ) > USAGE_PAGE_MAX_BYTES
-    ) {
+    const nextOffset = offset + items.length + 1;
+    if (!budget.tryAppend(item, nextOffset < total ? nextOffset : null)) {
       break;
     }
     items.push(item);
@@ -729,8 +721,4 @@ function projectCodePoint(codePoint: string): string {
   return scalar !== undefined && (scalar <= 0x1f || (scalar >= 0x7f && scalar <= 0x9f))
     ? '\ufffd'
     : codePoint;
-}
-
-function jsonBytes(value: unknown): number {
-  return Buffer.byteLength(JSON.stringify(value), 'utf8');
 }

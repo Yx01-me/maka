@@ -33,7 +33,15 @@ import {
 import {
   runDesktopRuntimeHostWslManagement,
   runDesktopRuntimeHostWslSetup,
+  runDesktopRuntimeHostWslUpdate,
 } from '../runtime-host-wsl-controller.js';
+
+const OPERATOR = {
+  kind: 'node' as const,
+  platform: 'posix' as const,
+  nodePath: '/usr/bin/node',
+  modulePath: '/home/operator/.local/share/maka/operator.mjs',
+};
 
 test('WSL management invokes the stable operator directly with the exact deployment target', async () => {
   let launch:
@@ -58,7 +66,7 @@ test('WSL management invokes the stable operator directly with the exact deploym
   });
   const result = await runDesktopRuntimeHostWslManagement({
     distribution: 'Ubuntu',
-    operatorPath: '/home/operator/.local/share/maka/operator',
+    operator: OPERATOR,
     action: 'configure',
     expectedTarget: {
       serviceId: 'a'.repeat(64),
@@ -90,11 +98,12 @@ test('WSL management invokes the stable operator directly with the exact deploym
   });
 
   assert.equal(launch?.executable, 'wsl.exe');
-  assert.deepEqual(launch?.args.slice(0, 5), [
+  assert.deepEqual(launch?.args.slice(0, 6), [
     '--distribution',
     'Ubuntu',
     '--exec',
-    '/home/operator/.local/share/maka/operator',
+    '/usr/bin/node',
+    '/home/operator/.local/share/maka/operator.mjs',
     'configure',
   ]);
   assert.ok(launch?.args.includes('--expected-deployment-id'));
@@ -136,7 +145,7 @@ test('WSL setup forwards the development archive and its exact evidence', async 
           version: '0.2.0-development',
           serviceId: 'b'.repeat(64),
           deploymentId: '00000000-0000-4000-8000-000000000001',
-          operatorPath: '/tmp/maka/operator',
+          operator: { ...OPERATOR, modulePath: '/tmp/maka/operator.mjs' },
           rootPath: '/tmp/maka/root',
           rootId: 'a'.repeat(64),
           endpoint: 'ws://127.0.0.1:7443/runtime-host',
@@ -171,7 +180,110 @@ test('WSL setup forwards the development archive and its exact evidence', async 
     'C:\\maka-development.tgz',
   ]);
   const setupCommand = launches[1]?.at(-1) ?? '';
+  assert.match(setupCommand, /\$\{SHELL:-\/bin\/sh\}.*-lic/u);
   assert.match(setupCommand, new RegExp(`${RUNTIME_HOST_SETUP_SOURCE_PACKAGE_INTEGRITY_ENV}=`, 'u'));
   assert.ok(setupCommand.includes(integrity));
+  assert.match(setupCommand, /--update-existing/u);
+  assert.doesNotMatch(setupCommand, /--allow-interrupt-active-tasks/u);
   assert.match(setupCommand, /--package.*\/mnt\/c\/maka-development\.tgz/u);
+});
+
+
+test('released WSL onboarding cannot authorize replacement or interruption', async () => {
+  let command = '';
+  await assert.rejects(runDesktopRuntimeHostWslSetup({
+    distribution: 'Ubuntu',
+    setupPackage: { kind: 'npm', specifier: 'maka-agent@0.2.0' },
+    principalId: 'desktop:client',
+  }, () => undefined, undefined, {
+    wslExecutable: 'wsl.exe',
+    processFactory: (_executable, args) => {
+      command = args.at(-1) ?? '';
+      const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      Object.assign(child, { stdin: new PassThrough(), stdout, stderr, kill: () => true });
+      process.nextTick(() => {
+        stdout.end(encodeRuntimeHostSetupFrame({
+          schemaVersion: 1, sequence: 0, kind: 'error',
+          error: { code: 'version_change_requires_update', message: 'Use the update workflow' },
+        }));
+        stderr.end();
+        child.emit('close', 1, null);
+      });
+      return child;
+    },
+  }), /Use the update workflow/u);
+  assert.doesNotMatch(command, /--update-existing|--allow-interrupt-active-tasks/u);
+  assert.match(command, /--reuse-existing-environment/u);
+});
+
+
+test('WSL update cancellation closes retirement input without killing the transaction', async () => {
+  const abort = new AbortController();
+  let finish!: () => void;
+  let stdin!: PassThrough;
+  let killed = false;
+  let launch: readonly string[] = [];
+  const running = runDesktopRuntimeHostWslUpdate({
+    distribution: 'Ubuntu', setupPackage: { kind: 'npm', specifier: 'maka-agent@0.3.0' },
+    expectedTarget: { serviceId: 'a'.repeat(64), rootId: 'a'.repeat(64), rootPath: '/state', deploymentId: '00000000-0000-4000-8000-000000000001' },
+    expectedConfigFingerprint: `sha256:${'b'.repeat(64)}`,
+    expectedHost: { hostEpoch: 'old-host', pid: 42 },
+    expectedSourceVersion: '0.2.0',
+    allowInterruptActiveTasks: false, signal: abort.signal,
+  }, () => {}, {
+    wslExecutable: 'wsl.exe',
+    processFactory: (_executable, args) => {
+      launch = args;
+      const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+      stdin = new PassThrough();
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      Object.assign(child, { stdin, stdout, stderr, kill: () => { killed = true; return true; } });
+      finish = () => {
+        stdout.end(); stderr.end(); child.emit('close', 1, null);
+      };
+      return child;
+    },
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(stdin.writableEnded, false);
+  assert.match(launch.at(-1)!, /\$\{SHELL:-\/bin\/sh\}.*-lic/u);
+  assert.match(launch.at(-1)!, /npx.*--package.*maka-agent@0\.3\.0/u);
+  assert.match(launch.at(-1)!, /--expected-config-fingerprint/u);
+  assert.match(launch.at(-1)!, /--expected-host-json/u);
+  assert.doesNotMatch(launch.at(-1)!, /--allow-interrupt-active-tasks/u);
+  let settled = false;
+  const outcome = running.finally(() => { settled = true; });
+  const rejected = assert.rejects(outcome, /abort/iu);
+  abort.abort();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(stdin.writableEnded, true);
+  assert.equal(killed, false);
+  assert.equal(settled, false);
+  finish();
+  await rejected;
+});
+
+
+test('released WSL discovery accepts an existing binding without a credential or package mutation', async () => {
+  const existing = {
+    schemaVersion: 1 as const, sequence: 0, kind: 'existing_environment' as const,
+    version: '0.3.0', serviceId: 'a'.repeat(64), rootId: 'a'.repeat(64), rootPath: '/state',
+    deploymentId: '00000000-0000-4000-8000-000000000001', operator: OPERATOR,
+  };
+  const result = await runDesktopRuntimeHostWslSetup({
+    distribution: 'Ubuntu', setupPackage: { kind: 'npm', specifier: 'maka-agent@0.2.0' }, principalId: 'desktop:client',
+  }, () => {}, undefined, {
+    wslExecutable: 'wsl.exe',
+    processFactory: () => {
+      const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+      const stdout = new PassThrough(); const stderr = new PassThrough();
+      Object.assign(child, { stdin: new PassThrough(), stdout, stderr, kill: () => true });
+      process.nextTick(() => { stdout.end(encodeRuntimeHostSetupFrame(existing)); stderr.end(); child.emit('close', 0, null); });
+      return child;
+    },
+  });
+  assert.deepEqual(result, existing);
 });

@@ -64,7 +64,11 @@ application -> shared contracts + injected ports
   preload, main, or `platform/desktop`. Consumers use its public `index` entry;
   `testing` is test/Storybook-only.
 - `platform/desktop/` is the outer adapter zone for the preload bridge. It
-  implements narrow inward-facing ports rather than exporting the whole bridge;
+  implements narrow inward-facing ports rather than exporting the whole bridge:
+  where a port is a structural subset of one bridge namespace the adapter hands
+  that namespace through as-is (`sessions: bridge.sessions`) instead of
+  restating each method, and hand-writes the blocks that rename, guard, or
+  translate;
   composition and adapters consume application public entries, not deep
   implementation modules. Adapters may own bridge and browser-environment
   access, but never React UI/hooks/class lifecycle, Electron/Node imports, or
@@ -99,20 +103,44 @@ not grow. Their transitive support closures ratchet only architectural
 capabilities and dependencies, so ordinary implementation can evolve without
 token-count ledger noise. A support entry may move one way from the AppShell
 closure to the root closure without resetting its budget; the reverse move is
-rejected. Legacy import allowlists may only shrink relative to the base branch. Same-count
-dependency replacement is allowed only when it moves ownership behind a shell,
-feature public, or application public/contract boundary.
+rejected. Legacy import allowlists may only shrink relative to the base branch.
+CI runs the checker as `--base <sha> --strict-base`: the ratchet re-derives the
+base commit's debt from its materialized tree rather than trusting its committed
+ledger, and `--strict-base` turns any failure to materialize or analyze that tree
+into a hard error. A silent fallback to the committed ledger could reintroduce
+the stale-ledger failure #4250 demonstrated, where a base ledger that
+under-reported its own tree wedged CI. When the checker script itself differs
+from the base commit, the base commit's checker is also imported to measure
+both trees, and debt the base measurement rules (generation and classification)
+would have flagged fails as a `base-checker cross-check:` violation, so one
+change cannot loosen how debt is measured and lower both sides of the ratchet
+at once. Under `--strict-base`, failure to write, import, or run an existing
+base checker, a missing `generateArchitectureConfig` export, or output that
+does not match the current ledger schema is a hard error. Without the flag,
+these conditions are reported and the cross-check is skipped. A base commit
+without a checker has no old measurement rules to run and is skipped in both
+modes. The schema validation and comparison still run under the current checker;
+changes to those rules remain a review concern. In particular, changes to
+`validateMonotonicDebt` are not protected by the cross-check.
 
-Validated copy catalogs are the one admitted dependency class: the locale
-policy (#2672) forces user-visible copy out of business files and into
-`locales/*-copy.ts` catalogs, which necessarily adds import edges the debt
+Dependency-path debt prices only regressive runtime edges. Type-only imports
+are erased at compile time and never count. Edges into a shell, feature public,
+or application public/contract boundary are the direction the migration wants,
+so the AppShell family and both closures may add them freely; root entries may
+not, because `main.tsx` and `app.tsx` are meant to become thin mounts, and
+they may only replace an existing edge, same-count, with a bootstrap or
+composition target (their closure may also replace into application or
+platform).
+
+Validated copy catalogs are admitted for every section, root entries included:
+the locale policy (#2672) forces user-visible copy out of business files and
+into `locales/*-copy.ts` catalogs, which necessarily adds import edges the debt
 ratchet would otherwise forbid. A catalog is admitted structurally, re-verified
 on every run: it must carry a `UiCatalog` marker from `@maka/core/ui-locale`,
 record zero tracked hook/bridge/lifecycle/environment/action-factory
 capabilities, and keep its runtime imports to bare package specifiers — never
 relative or `@maka/desktop/` paths — so a catalog cannot become a dependency
-tunnel. Type-only imports are erased at compile time and stay admitted
-regardless of target. A `locales/*-copy.ts` file that fails validation is a
+tunnel. A `locales/*-copy.ts` file that fails validation is a
 dedicated violation (`copy catalog validation failed: …`), never a silent fall
 back to the ratchet. Admitted edges are excluded from dependency-count
 ratchets, closure admission, and feature/Desktop-adapter legacy budgets;

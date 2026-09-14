@@ -23,14 +23,21 @@ import type {
   ClientCapabilityGrantTarget,
   ClientCapabilitySessionGrant,
 } from '@maka/core/client-capability-grant';
-import type { SandboxBoundaryRequestEvent, UserQuestionRequestEvent } from '@maka/core/events';
+import type {
+  FormRequestEvent,
+  SandboxBoundaryRequestEvent,
+  UserQuestionRequestEvent,
+} from '@maka/core/events';
 import {
   isInteractionAnswerValidForRequest,
   projectInteractionClientCapabilityRequest,
   projectInteractionSandboxBoundaryRequest,
+  projectInteractionFormRequest,
   projectInteractionQuestionRequest,
   type InteractionCanonicalOutcome,
   type InteractionClosureReason,
+  type InteractionFormRequest,
+  type InteractionFormResult,
 } from '@maka/core/interaction';
 import type {
   SandboxBoundaryRequest,
@@ -45,6 +52,7 @@ import {
   type RuntimeInteractionRunClosureReason,
   type RuntimeInteractionRunIdentity,
   type RuntimeInteractionRunOwner,
+  type RuntimeFormContinuation,
   type RuntimeSandboxBoundaryContinuation,
   type RuntimeUserQuestionContinuation,
 } from '@maka/runtime/interaction-authority';
@@ -70,8 +78,10 @@ import {
   projectInteractionRecord,
   projectSandboxBoundaryInteraction,
   projectSessionInteractions,
+  formCanonicalOutcome,
   questionCanonicalOutcome,
   runtimeQuestionOutcome,
+  runtimeFormOutcome,
 } from './interaction-projection.js';
 import type { InteractionOperationHandlerMap } from './operation-dispatcher.js';
 import { type SessionAdmissionLease, SessionAdmissionGate } from './session-admission-gate.js';
@@ -128,6 +138,13 @@ interface LiveQuestionEntry extends LiveEntryBase {
   readonly continuation: RuntimeUserQuestionContinuation;
 }
 
+interface LiveFormEntry extends LiveEntryBase {
+  readonly kind: 'form';
+  readonly request: StoredInteractionRequest;
+  readonly continuation: RuntimeFormContinuation;
+  readonly hostResult?: Promise<HostFormResult>;
+}
+
 interface LiveSandboxBoundaryEntry extends LiveEntryBase {
   readonly kind: 'sandbox_boundary';
   readonly boundaryRequest: SandboxBoundaryRequest;
@@ -142,10 +159,11 @@ interface LiveClientCapabilityEntry extends LiveEntryBase {
   readonly reject: (error: unknown) => void;
 }
 
-type LiveStoredEntry = LiveQuestionEntry | LiveClientCapabilityEntry;
+type LiveStoredEntry = LiveQuestionEntry | LiveFormEntry | LiveClientCapabilityEntry;
 type LiveEntry = LiveStoredEntry | LiveSandboxBoundaryEntry;
 type LiveStoredCandidate =
   | Omit<LiveQuestionEntry, 'run' | 'phase'>
+  | Omit<LiveFormEntry, 'run' | 'phase'>
   | Omit<LiveClientCapabilityEntry, 'run' | 'phase'>;
 
 interface CommittedEntry {
@@ -156,6 +174,18 @@ interface CommittedEntry {
 interface SettledSandboxBoundaryEntry {
   readonly entry: LiveSandboxBoundaryEntry;
   readonly settlement: SandboxBoundarySettlement;
+}
+
+export interface HostFormResult {
+  readonly createdAt: number;
+  readonly answer: InteractionFormResult;
+}
+
+export interface HostFormInput extends RuntimeInteractionRunIdentity {
+  /** Caller-derived immutable request identity, including the operation input digest. */
+  readonly requestId: string;
+  /** Only evaluated for a new request; replay uses the durable offered options. */
+  readonly create: () => Promise<InteractionFormRequest>;
 }
 
 export interface ClientCapabilityApprovalInput {
@@ -237,12 +267,82 @@ export class HostInteractionCoordinator implements RuntimeInteractionAuthority {
       acceptUserQuestionRequest: (
         input: Parameters<RuntimeInteractionRunOwner['acceptUserQuestionRequest']>[0],
       ) => this.#acceptUserQuestionRequest(run, input),
+      acceptFormRequest: (input: Parameters<RuntimeInteractionRunOwner['acceptFormRequest']>[0]) =>
+        this.#acceptFormRequest(run, input),
+      withdrawFormRequest: (requestId: string) => this.#withdrawFormRequest(run, requestId),
       acceptSandboxBoundaryRequest: (
         input: Parameters<RuntimeInteractionRunOwner['acceptSandboxBoundaryRequest']>[0],
       ) => this.#acceptSandboxBoundaryRequest(run, input),
       close: (reason: RuntimeInteractionRunClosureReason) => this.#closeRun(run, reason),
       release: () => this.#releaseRun(run),
     });
+  }
+
+  /** Host tools share Runtime's durable interaction lifecycle without rebinding its Run. */
+  async requestForm(input: HostFormInput): Promise<HostFormResult> {
+    this.#throwIfPoisoned();
+    const run = this.#runs.get(runKey(input));
+    if (!run || !run.bound || run.released) {
+      throw new RuntimeInteractionAdmissionRejectedError(input.requestId, 'invalid_request');
+    }
+    this.#assertRunOpen(run, input.requestId);
+    const replay = await this.#readInteraction(input.requestId);
+    if (replay) {
+      if (runKey(replay.request) !== runKey(input) || replay.request.request.kind !== 'form') {
+        throw new RuntimeInteractionAdmissionRejectedError(input.requestId, 'invalid_request');
+      }
+      if (replay.outcome) {
+        const outcome = runtimeFormOutcome(replay.outcome.outcome);
+        return {
+          createdAt: replay.request.createdAt,
+          answer: outcome.kind === 'form_answer' ? outcome.answer : { action: 'cancel' },
+        };
+      }
+    }
+    const existing = this.#live.get(input.requestId);
+    if (existing?.kind === 'form' && existing.run === run && existing.hostResult)
+      return existing.hostResult;
+    // An orphaned pending record cannot resurrect a continuation after a Host restart.
+    if (replay)
+      throw new RuntimeInteractionAdmissionRejectedError(input.requestId, 'request_settled');
+    const request = projectInteractionFormRequest(await input.create());
+    const concurrent = this.#live.get(input.requestId);
+    if (concurrent?.kind === 'form' && concurrent.run === run && concurrent.hostResult)
+      return concurrent.hostResult;
+    this.#assertRunOpen(run, input.requestId);
+    const createdAt = this.#now();
+    let settle!: (answer: InteractionFormResult) => void;
+    let reject!: (error: unknown) => void;
+    const hostResult = observed(
+      new Promise<HostFormResult>((resolve, fail) => {
+        settle = (answer) => resolve({ createdAt, answer });
+        reject = fail;
+      }),
+    );
+    try {
+      await this.#accept(run, {
+        kind: 'form',
+        request: { ...runIdentity(run), requestId: input.requestId, createdAt, request },
+        hostResult,
+        continuation: {
+          requestId: input.requestId,
+          turnId: run.turnId,
+          runId: run.runId,
+          applyAnswer: async (answer) => {
+            settle(answer);
+          },
+          applyClosure: async () => {
+            settle({ action: 'cancel' });
+          },
+          // Host publication is performed by #accept, with no Runtime event producer to await.
+          waitForPublication: async () => {},
+        },
+      });
+    } catch (error) {
+      reject(error);
+      throw error;
+    }
+    return hostResult;
   }
 
   async requestClientCapabilityApproval(
@@ -481,6 +581,45 @@ export class HostInteractionCoordinator implements RuntimeInteractionAuthority {
     }
   }
 
+  #acceptFormRequest(
+    run: BoundRun,
+    input: Parameters<RuntimeInteractionRunOwner['acceptFormRequest']>[0],
+  ): Promise<void> {
+    try {
+      this.#assertAcceptable(run, input.request, input.continuation);
+      let request: ReturnType<typeof projectInteractionFormRequest>;
+      try {
+        request = projectInteractionFormRequest({
+          toolUseId: input.request.toolUseId,
+          message: input.request.message,
+          requester: input.request.requester,
+          fields: input.request.fields,
+        });
+      } catch {
+        return rejected(
+          new RuntimeInteractionAdmissionRejectedError(
+            input.continuation.requestId,
+            'invalid_request',
+          ),
+        );
+      }
+      return observed(
+        this.#accept(run, {
+          kind: 'form',
+          request: {
+            ...runIdentity(run),
+            requestId: input.continuation.requestId,
+            createdAt: input.request.ts,
+            request,
+          },
+          continuation: input.continuation,
+        }).then(() => undefined),
+      );
+    } catch (error) {
+      return rejected(error);
+    }
+  }
+
   #acceptSandboxBoundaryRequest(
     run: BoundRun,
     input: Parameters<RuntimeInteractionRunOwner['acceptSandboxBoundaryRequest']>[0],
@@ -645,9 +784,12 @@ export class HostInteractionCoordinator implements RuntimeInteractionAuthority {
         ),
       );
     }
-    const questions = await this.#readPending({ sessionId: run.sessionId });
+    const storedInteractions = await this.#readPending({ sessionId: run.sessionId });
     const sandboxBoundaries = await this.#readPendingSandboxBoundaries(run.sessionId);
-    if (questions.length + sandboxBoundaries.length >= INTERACTION_MAX_PENDING_PER_SESSION) {
+    if (
+      storedInteractions.length + sandboxBoundaries.length >=
+      INTERACTION_MAX_PENDING_PER_SESSION
+    ) {
       throw new RuntimeInteractionAdmissionRejectedError(
         input.request.requestId,
         'capacity_exceeded',
@@ -664,7 +806,10 @@ export class HostInteractionCoordinator implements RuntimeInteractionAuthority {
       turnId: run.turnId,
       runId: run.runId,
     };
-    const projection = projectSessionInteractions(questions, [...sandboxBoundaries, candidate]);
+    const projection = projectSessionInteractions(storedInteractions, [
+      ...sandboxBoundaries,
+      candidate,
+    ]);
     if (!(await this.#preflightSessionSnapshot(run.sessionId, projection, admission))) {
       throw new RuntimeInteractionAdmissionRejectedError(
         input.request.requestId,
@@ -743,7 +888,7 @@ export class HostInteractionCoordinator implements RuntimeInteractionAuthority {
             if (record.request.sessionId !== input.sessionId) return interactionNotFound();
             return record.request.request.kind === 'client_capability'
               ? this.#answerClientCapability(record, input.answer, admission)
-              : this.#answerQuestion(record, input.answer, admission);
+              : this.#answerStoredInteraction(record, input.answer, admission);
           }
           const sandboxBoundary = await this.#readSandboxBoundary(
             input.sessionId,
@@ -760,7 +905,7 @@ export class HostInteractionCoordinator implements RuntimeInteractionAuthority {
     );
   }
 
-  async #answerQuestion(
+  async #answerStoredInteraction(
     record: InteractionRecord,
     answer: InteractionAnswerInput['answer'],
     admission: SessionAdmissionLease,
@@ -771,18 +916,26 @@ export class HostInteractionCoordinator implements RuntimeInteractionAuthority {
         : operationConflict('Sandbox boundary authority is not stored in InteractionStore');
     }
     if (record.outcome) return answerOutcome(recordWithOutcome(record), answer);
-    if (record.request.request.kind !== 'question' || answer.kind !== 'question') {
+    if (
+      (record.request.request.kind !== 'question' && record.request.request.kind !== 'form') ||
+      record.request.request.kind !== answer.kind
+    ) {
       return operationConflict('Interaction answer does not match the pending request');
     }
     if (!isInteractionAnswerValidForRequest(record.request.request, answer)) {
       return operationConflict('Interaction answer does not match the pending request');
     }
-    const entry = this.#requireLiveQuestion(record.request);
-    const outcome = await this.#commitAnswer(
-      entry,
-      questionCanonicalOutcome(answer, this.#now()),
-      admission,
-    );
+    const entry = this.#requireLiveStored(record.request);
+    const candidate =
+      answer.kind === 'question'
+        ? questionCanonicalOutcome(answer, this.#now())
+        : answer.kind === 'form'
+          ? formCanonicalOutcome(answer, this.#now())
+          : undefined;
+    if (!candidate) {
+      return operationConflict('Interaction answer does not match the pending request');
+    }
+    const outcome = await this.#commitAnswer(entry, candidate, admission);
     return answerOutcome({ request: record.request, outcome }, answer);
   }
 
@@ -861,8 +1014,8 @@ export class HostInteractionCoordinator implements RuntimeInteractionAuthority {
   }
 
   async #commitAnswer(
-    entry: LiveQuestionEntry,
-    candidate: Extract<InteractionCanonicalOutcome, { kind: 'question_answer' }>,
+    entry: LiveStoredEntry,
+    candidate: Extract<InteractionCanonicalOutcome, { kind: 'question_answer' | 'form_answer' }>,
     admission: SessionAdmissionLease,
   ): Promise<StoredInteractionOutcome> {
     const target = await this.#commitOutcome(entry.request, candidate);
@@ -894,6 +1047,60 @@ export class HostInteractionCoordinator implements RuntimeInteractionAuthority {
         });
       }
       return closure.task;
+    } catch (error) {
+      return rejected(error);
+    }
+  }
+
+  #withdrawFormRequest(run: BoundRun, requestId: string): Promise<void> {
+    try {
+      this.#assertOwnedRun(run);
+      this.#throwIfPoisoned();
+      if (run.released) {
+        throw this.#poison(
+          new RuntimeInteractionInvariantError(
+            `Released Interaction Run ${run.runId} cannot withdraw a form`,
+          ),
+        );
+      }
+      return observed(
+        this.#sessionAdmission.run(run.sessionId, async (admission) => {
+          this.#throwIfPoisoned();
+          // A whole-Run stop/terminal closure that already claimed ownership
+          // remains the reason for every still-pending Interaction in that Run.
+          if (run.closure) return;
+          const record = await this.#readInteraction(requestId);
+          // Cancellation may win while admission is still proving publication.
+          // The producer will also observe its abort and must not publish afterward.
+          if (!record) return;
+          if (!sameRun(record.request, run) || record.request.request.kind !== 'form') {
+            throw this.#poison(
+              new RuntimeInteractionInvariantError(
+                `Interaction Run ${run.runId} cannot withdraw form ${requestId}`,
+              ),
+            );
+          }
+          // A canonical user answer or Run closure that won the Session admission
+          // race stays authoritative.
+          if (record.outcome) return;
+          const entry = this.#requireLiveStored(record.request);
+          if (entry.kind !== 'form' || entry.run !== run) {
+            throw this.#poison(
+              new RuntimeInteractionInvariantError(
+                `Form ${requestId} is not owned by Interaction Run ${run.runId}`,
+              ),
+            );
+          }
+          const outcome = await this.#commitOutcome(record.request, {
+            kind: 'closure',
+            reason: 'producer_cancelled',
+            committedAt: this.#now(),
+          });
+          await this.#refreshCanonicalContinuity(run.sessionId, admission);
+          this.#throwIfPoisoned();
+          await this.#applyAndDelete(entry, outcome);
+        }),
+      );
     } catch (error) {
       return rejected(error);
     }
@@ -950,10 +1157,7 @@ export class HostInteractionCoordinator implements RuntimeInteractionAuthority {
       const pending = await this.#readPending(runIdentity(run));
       const committed: CommittedEntry[] = [];
       for (const request of pending.sort(compareStoredInteractionRequests)) {
-        const entry =
-          request.request.kind === 'client_capability'
-            ? this.#requireLiveClientCapability(request)
-            : this.#requireLiveQuestion(request);
+        const entry = this.#requireLiveStored(request);
         const closureOutcome = {
           kind: 'closure' as const,
           reason: closure.reason,
@@ -1057,25 +1261,35 @@ export class HostInteractionCoordinator implements RuntimeInteractionAuthority {
       const sessions = new Map<
         string,
         {
-          questions: StoredInteractionRequest[];
+          storedInteractions: StoredInteractionRequest[];
           sandboxBoundaries: SandboxBoundaryRequest[];
         }
       >();
-      const pendingQuestions = await this.#readPending();
+      const pendingInteractions = await this.#readPending();
       const pendingSandboxBoundaries = await this.#readAllPendingSandboxBoundaries();
-      for (const request of pendingQuestions) {
+      for (const request of pendingInteractions) {
         const requests = sessions.get(request.sessionId);
-        if (requests) requests.questions.push(request);
-        else sessions.set(request.sessionId, { questions: [request], sandboxBoundaries: [] });
+        if (requests) requests.storedInteractions.push(request);
+        else {
+          sessions.set(request.sessionId, {
+            storedInteractions: [request],
+            sandboxBoundaries: [],
+          });
+        }
       }
       for (const request of pendingSandboxBoundaries) {
         const requests = sessions.get(request.sessionId);
         if (requests) requests.sandboxBoundaries.push(request);
-        else sessions.set(request.sessionId, { questions: [], sandboxBoundaries: [request] });
+        else {
+          sessions.set(request.sessionId, {
+            storedInteractions: [],
+            sandboxBoundaries: [request],
+          });
+        }
       }
       for (const [sessionId, requests] of sessions) {
         if (
-          requests.questions.length + requests.sandboxBoundaries.length >
+          requests.storedInteractions.length + requests.sandboxBoundaries.length >
           INTERACTION_MAX_PENDING_PER_SESSION
         ) {
           throw new RuntimeInteractionInvariantError(
@@ -1083,7 +1297,9 @@ export class HostInteractionCoordinator implements RuntimeInteractionAuthority {
           );
         }
         await this.#sessionAdmission.run(sessionId, async (admission) => {
-          for (const request of requests.questions.sort(compareStoredInteractionRequests)) {
+          for (const request of requests.storedInteractions.sort(
+            compareStoredInteractionRequests,
+          )) {
             const closure = {
               kind: 'closure' as const,
               reason: 'host_restarted' as const,
@@ -1288,11 +1504,20 @@ export class HostInteractionCoordinator implements RuntimeInteractionAuthority {
       return;
     }
     try {
-      const projected = runtimeQuestionOutcome(outcome.outcome);
+      const projected =
+        entry.kind === 'question'
+          ? runtimeQuestionOutcome(outcome.outcome)
+          : runtimeFormOutcome(outcome.outcome);
       if (projected.kind === 'closure') {
         await entry.continuation.applyClosure(projected.reason);
-      } else {
+      } else if (entry.kind === 'question' && projected.kind === 'question_answer') {
         await entry.continuation.applyAnswer(projected.answer);
+      } else if (entry.kind === 'form' && projected.kind === 'form_answer') {
+        await entry.continuation.applyAnswer(projected.answer);
+      } else {
+        throw new RuntimeInteractionInvariantError(
+          `Stored Interaction ${entry.request.requestId} projected the wrong answer kind`,
+        );
       }
     } catch (error) {
       throw this.#poison(error);
@@ -1352,17 +1577,18 @@ export class HostInteractionCoordinator implements RuntimeInteractionAuthority {
     }
   }
 
-  #requireLiveQuestion(request: StoredInteractionRequest): LiveQuestionEntry {
+  #requireLiveStored(request: StoredInteractionRequest): LiveStoredEntry {
     const entry = this.#live.get(request.requestId);
     if (
       !entry ||
-      entry.kind !== 'question' ||
+      entry.kind === 'sandbox_boundary' ||
+      entry.kind !== request.request.kind ||
       entry.phase !== 'live' ||
       !isDeepStrictEqual(entry.request, request)
     ) {
       throw this.#poison(
         new RuntimeInteractionInvariantError(
-          `Pending question Interaction ${request.requestId} has no exact live continuation`,
+          `Pending stored Interaction ${request.requestId} has no exact live continuation`,
         ),
       );
     }

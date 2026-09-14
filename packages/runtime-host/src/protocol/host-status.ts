@@ -24,10 +24,15 @@ import {
   requireExactRecord,
   requireId,
   requireRecord,
+  requireShapedRecord,
   requireString,
   requireUtf8String,
 } from './codec.js';
 import { defineOperation } from './operation-spec.js';
+import {
+  decodeSignedPeerReachabilityLease,
+  type SignedPeerReachabilityLeaseV1,
+} from '../peer-reachability/model.js';
 
 export type HostLifecycleState = 'starting' | 'containing' | 'recovering' | 'ready' | 'draining';
 export type HostStatusInput = Record<string, never>;
@@ -37,19 +42,25 @@ export interface HostActivitySnapshot {
   readonly activeOperations: number;
   readonly processUptimeSeconds: number;
   readonly residencies: readonly { readonly label: string; readonly count: number }[];
+  /** Negotiated maintenance evidence. Absent on released Hosts: every residency is conservative. */
+  readonly drainResidencies?: number;
+  readonly cooperativeHandoff?: boolean;
 }
 
 export function isHostActivityIdle(activity: HostActivitySnapshot): boolean {
   return (
     activity.connections === 0 &&
     activity.activeOperations === 0 &&
-    activity.residencies.length === 0
+    (activity.drainResidencies === undefined
+      ? activity.residencies.length === 0
+      : activity.drainResidencies === 0)
   );
 }
 
 export interface HostUpgradePrepareInput {
   readonly expectedHostEpoch: string;
   readonly allowInterruptActiveTasks: boolean;
+  readonly allowCooperativeHandoff?: boolean;
 }
 
 export type HostUpgradePrepareResult =
@@ -59,9 +70,6 @@ export type HostUpgradePrepareResult =
 export const HOST_DIAGNOSTICS_RESULT_MAX_BYTES = 72 * 1024;
 export const HOST_DIAGNOSTIC_LOG_MAX_ENTRIES = 256;
 export const HOST_DIAGNOSTIC_LOG_MAX_ENTRY_BYTES = 10 * 1024;
-const HOST_PEER_ID_MAX_BYTES = 160;
-const HOST_PEER_ADDRESS_MAX_BYTES = 2 * 1024;
-const HOST_PEER_ROUTE_MAX = 16;
 
 export interface HostStatusResult {
   hostEpoch: string;
@@ -74,15 +82,18 @@ export interface HostStatusResult {
   peerEndpoint?: HostPeerEndpoint;
 }
 
-export interface HostPeerEndpoint {
-  readonly peerId: string;
-  readonly routeHints: readonly string[];
-  readonly coordinationRelays: readonly string[];
-}
+export type HostPeerEndpoint = SignedPeerReachabilityLeaseV1;
 
 export interface HostDiagnosticsResult extends HostStatusResult {
   compositionModules: readonly string[];
   residencies: readonly { label: string; count: number }[];
+  /**
+   * The Host's authoritative answer to "would a maintenance drain interrupt
+   * active work right now", computed by the same authority that gates
+   * `host.upgrade.prepare`. Required: the epoch gate already refuses
+   * mixed-version peers, so there is no wire case where it is absent.
+   */
+  upgradeBlockingActivity: boolean;
   protocolVersion: number;
   compatibilityEpoch: number;
   pid: number;
@@ -117,19 +128,6 @@ export const HOST_BOOTSTRAP_OPERATION_SPECS = {
     decodeOutput: decodeHostUpgradePrepareResult,
   }),
 } as const;
-
-function decodePeerAddresses(value: unknown, label: string): readonly string[] {
-  if (!Array.isArray(value) || value.length > HOST_PEER_ROUTE_MAX) {
-    throw invalidProtocolFrame(`Invalid ${label}`);
-  }
-  const addresses = value.map((address) =>
-    requireString(address, label, HOST_PEER_ADDRESS_MAX_BYTES),
-  );
-  if (new Set(addresses).size !== addresses.length) {
-    throw invalidProtocolFrame(`Duplicate ${label}`);
-  }
-  return Object.freeze(addresses);
-}
 
 function decodeEmptyHostInput(value: unknown, label: string): HostStatusInput {
   requireExactRecord(value, label, []);
@@ -167,6 +165,7 @@ function decodeHostDiagnosticsResult(value: unknown): HostDiagnosticsResult {
     'activeOperations',
     'activeResidencies',
     ...(valueRecord.peerEndpoint === undefined ? [] : ['peerEndpoint']),
+    'upgradeBlockingActivity',
     'compositionModules',
     'residencies',
     'protocolVersion',
@@ -190,6 +189,7 @@ function decodeHostDiagnosticsResult(value: unknown): HostDiagnosticsResult {
   }
   return {
     ...decodeHostStatusFields(record),
+    upgradeBlockingActivity: requireUpgradeBlockingActivity(record.upgradeBlockingActivity),
     compositionModules: record.compositionModules.map((moduleId) =>
       requireString(moduleId, 'Runtime Host composition module id', 64),
     ),
@@ -218,17 +218,37 @@ function decodeHostDiagnosticsResult(value: unknown): HostDiagnosticsResult {
   };
 }
 
+function requireUpgradeBlockingActivity(value: unknown): boolean {
+  if (typeof value !== 'boolean') {
+    throw invalidProtocolFrame('Invalid Runtime Host upgrade blocking activity');
+  }
+  return value;
+}
+
 export function decodeHostActivitySnapshot(value: unknown): HostActivitySnapshot {
-  const record = requireExactRecord(value, 'Runtime Host activity', [
-    'connections',
-    'activeOperations',
-    'processUptimeSeconds',
-    'residencies',
-  ]);
+  const record = requireShapedRecord(
+    value,
+    'Runtime Host activity',
+    ['connections', 'activeOperations', 'processUptimeSeconds', 'residencies'],
+    ['drainResidencies', 'cooperativeHandoff'],
+  );
   if (!Array.isArray(record.residencies) || record.residencies.length > 128) {
     throw invalidProtocolFrame('Invalid Runtime Host activity residencies');
   }
   return {
+    ...(record.cooperativeHandoff === undefined
+      ? {}
+      : {
+          cooperativeHandoff: requireBoolean(
+            record.cooperativeHandoff,
+            'Runtime Host cooperative handoff capability',
+          ),
+        }),
+    ...(record.drainResidencies === undefined
+      ? {}
+      : {
+          drainResidencies: requireCount(record.drainResidencies, 'Runtime Host drain residencies'),
+        }),
     connections: requireCount(record.connections, 'Runtime Host activity connections'),
     activeOperations: requireCount(
       record.activeOperations,
@@ -252,16 +272,26 @@ export function decodeHostActivitySnapshot(value: unknown): HostActivitySnapshot
 }
 
 function decodeHostUpgradePrepareInput(value: unknown): HostUpgradePrepareInput {
-  const record = requireExactRecord(value, 'Runtime Host upgrade prepare input', [
-    'expectedHostEpoch',
-    'allowInterruptActiveTasks',
-  ]);
+  const record = requireShapedRecord(
+    value,
+    'Runtime Host upgrade prepare input',
+    ['expectedHostEpoch', 'allowInterruptActiveTasks'],
+    ['allowCooperativeHandoff'],
+  );
   return {
     expectedHostEpoch: requireId(record.expectedHostEpoch, 'Runtime Host expected Host Epoch'),
     allowInterruptActiveTasks: requireBoolean(
       record.allowInterruptActiveTasks,
       'Runtime Host upgrade interrupt authority',
     ),
+    ...(record.allowCooperativeHandoff === undefined
+      ? {}
+      : {
+          allowCooperativeHandoff: requireBoolean(
+            record.allowCooperativeHandoff,
+            'Runtime Host cooperative handoff authority',
+          ),
+        }),
   };
 }
 
@@ -304,19 +334,11 @@ function decodeHostStatusFields(record: Record<string, unknown>): HostStatusResu
 }
 
 function decodeHostPeerEndpoint(value: unknown): HostPeerEndpoint {
-  const record = requireExactRecord(value, 'Runtime Host peer endpoint', [
-    'peerId',
-    'routeHints',
-    'coordinationRelays',
-  ]);
-  return {
-    peerId: requireString(record.peerId, 'Runtime Host peer id', HOST_PEER_ID_MAX_BYTES),
-    routeHints: decodePeerAddresses(record.routeHints, 'Runtime Host peer route hints'),
-    coordinationRelays: decodePeerAddresses(
-      record.coordinationRelays,
-      'Runtime Host peer coordination relays',
-    ),
-  };
+  try {
+    return decodeSignedPeerReachabilityLease(value);
+  } catch {
+    throw invalidProtocolFrame('Invalid Runtime Host peer reachability lease');
+  }
 }
 
 function requirePlatform(value: unknown): NodeJS.Platform {

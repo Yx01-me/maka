@@ -24,7 +24,10 @@ import type {
   SessionCollaborationMountSummary,
 } from '../../../shared/session-collaboration.js';
 import type {
+  CollaborationTurnRequestAcknowledgeResult,
   CollaborationTurnRequestDecideResult,
+  CollaborationTurnRequestQueryResult,
+  CollaborationTurnRequestWithdrawResult,
   SessionTurnAccessRequest,
 } from '@maka/runtime-host/protocol';
 
@@ -44,7 +47,30 @@ export interface SessionCollaborationServices {
   cancelImport(operationId: string): Promise<SessionCollaborationCancelResult>;
   readInvitationClipboard(): Promise<string>;
   listMounts(): Promise<readonly SessionCollaborationMountSummary[]>;
+  subscribeMountChanges(handler: () => void): () => void;
   removeMount(mountId: string): Promise<void>;
+  retryMount(mountId: string): Promise<void>;
+  renameMount(mountId: string, name: string): Promise<void>;
+  renamePrincipal(sessionId: string, principalId: string, displayName: string): Promise<{ readonly renamed: boolean }>;
+  requestTurn(
+    sessionId: string,
+    input:
+      | { readonly kind: 'start'; readonly turnId: string; readonly text: string }
+      | {
+          readonly kind: 'regenerate';
+          readonly turnId: string;
+          readonly sourceTurnId: string;
+        },
+  ): Promise<SessionTurnAccessRequest>;
+  getTurnRequests(sessionId: string): Promise<CollaborationTurnRequestQueryResult>;
+  acknowledgeTurnRequest(
+    sessionId: string,
+    requestId: string,
+  ): Promise<CollaborationTurnRequestAcknowledgeResult>;
+  withdrawTurnRequest(
+    sessionId: string,
+    requestId: string,
+  ): Promise<CollaborationTurnRequestWithdrawResult>;
   getPendingTurnRequests(): Promise<readonly SessionTurnAccessRequest[]>;
   decideTurnRequest(
     sessionId: string,

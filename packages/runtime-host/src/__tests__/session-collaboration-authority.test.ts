@@ -48,6 +48,56 @@ function sessionGuest(principalId: string) {
   return { principalId, principalKind: 'session_guest' as const };
 }
 
+async function unexpectedRegenerateTurn(): Promise<never> {
+  throw new Error('Unexpected regeneration request');
+}
+
+test('owner aliases survive Guest activation and restart without changing grants', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'maka-session-alias-'));
+  const authority = await openRuntimeHostAccessAuthority(directory);
+  try {
+    const prepared = await authority.prepareCollaborationInvitation('root-1', {
+      sessionId: 'session-1',
+      grantKinds: ['session_observation'],
+    });
+    const invitation = decodeCollaborationInvitationCode(prepared.invitationCode);
+    const credentialId = authority.authenticate(invitation.credential)?.credentialId;
+    assert.ok(credentialId);
+    const input = { principalId: prepared.principalId, displayName: '  Windows review  ' };
+    assert.deepEqual(await authority.renameCollaborationPrincipal(input), { renamed: true });
+    await authority.finalize(credentialId, 'guest-client', false);
+    const restarted = await openRuntimeHostAccessAuthority(directory);
+    const access = restarted.queryCollaborationAccess({ sessionId: 'session-1' });
+    assert.equal(access.principals[0]?.displayName, 'Windows review');
+    assert.deepEqual(access.grants, prepared.grants);
+    assert.equal(
+      authorizeRuntimeHostOperation(restarted.authenticate(invitation.credential)!, {
+        requestId: 'alias-guest',
+        operation: 'collaboration.principal.rename',
+        input,
+      }),
+      false,
+    );
+    assert.throws(() =>
+      HOST_OPERATION_SPECS['collaboration.principal.rename'].decodeInput({
+        ...input,
+        displayName: '  ',
+      }),
+    );
+    assert.throws(() =>
+      HOST_OPERATION_SPECS['collaboration.principal.rename'].decodeInput({
+        ...input,
+        displayName: '名'.repeat(86),
+      }),
+    );
+    await restarted.revokeCollaborationPrincipal(prepared.principalId);
+    assert.deepEqual(await restarted.renameCollaborationPrincipal(input), { renamed: false });
+    assert.equal(restarted.authenticate(invitation.credential), undefined);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('Session Guest invitation, grants, and revocation form one durable authority lifecycle', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'maka-session-collaboration-'));
   const authority = await openRuntimeHostAccessAuthority(directory);
@@ -72,10 +122,12 @@ test('Session Guest invitation, grants, and revocation form one durable authorit
       'collaboration.turn-request.create',
       'collaboration.turn-request.acknowledge',
       'collaboration.turn-request.query',
+      'collaboration.turn-request.withdraw',
       'runtime.resource.query',
       'session.shared.query',
       'subscription.open',
       'subscription.close',
+      'subscription.pty_interest.set',
       'session.transcript.page',
       'session.transcript.overlay.release',
       'access.credential.finalize',
@@ -142,6 +194,22 @@ test('Session Guest invitation, grants, and revocation form one durable authorit
 });
 
 test('Turn requests reject execution input that the Owner cannot review', () => {
+  assert.deepEqual(
+    HOST_OPERATION_SPECS['collaboration.turn-request.create'].decodeInput({
+      intent: {
+        sessionId: 'session-1',
+        turnId: 'turn-regenerated',
+        sourceTurnId: 'turn-original',
+      },
+    }),
+    {
+      intent: {
+        sessionId: 'session-1',
+        turnId: 'turn-regenerated',
+        sourceTurnId: 'turn-original',
+      },
+    },
+  );
   assert.throws(
     () =>
       HOST_OPERATION_SPECS['collaboration.turn-request.create'].decodeInput({
@@ -152,8 +220,58 @@ test('Turn requests reject execution input that the Owner cannot review', () => 
           skillSelection: { mode: 'all' },
         },
       }),
-    /Unknown Session Turn request intent field/u,
+    /Unknown Session Turn start request intent field/u,
   );
+});
+
+test('a Guest can withdraw only its own pending Turn request', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'maka-session-turn-request-withdraw-'));
+  const authority = await openRuntimeHostAccessAuthority(directory);
+  try {
+    const principalId = await activateTurnGuest(authority);
+    const otherPrincipalId = await activateTurnGuest(authority);
+    const request = await authority.createTurnAccessRequest(principalId, {
+      intent: {
+        sessionId: 'session-1',
+        turnId: 'turn-withdrawn',
+        content: { text: 'Do not run this' },
+      },
+    });
+
+    assert.deepEqual(
+      await authority.withdrawTurnAccessRequest(otherPrincipalId, {
+        requestId: request.requestId,
+      }),
+      { withdrawn: false },
+    );
+    assert.deepEqual(
+      await authority.withdrawTurnAccessRequest(principalId, { requestId: request.requestId }),
+      { withdrawn: true },
+    );
+    assert.equal(
+      authority.queryTurnAccessRequests(LOCAL_OWNER, { sessionId: 'session-1' }).requests.length,
+      0,
+    );
+
+    const approved = await authority.createTurnAccessRequest(principalId, {
+      intent: {
+        sessionId: 'session-1',
+        turnId: 'turn-approved',
+        content: { text: 'Run this' },
+      },
+    });
+    await authority.decideTurnAccessRequest('local_owner', {
+      requestId: approved.requestId,
+      decision: 'approve',
+    });
+    assert.deepEqual(
+      await authority.withdrawTurnAccessRequest(principalId, { requestId: approved.requestId }),
+      { withdrawn: false },
+    );
+  } finally {
+    await authority.close();
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('Owner can query one durable Turn-request inbox without exposing another Guest', async () => {
@@ -246,6 +364,7 @@ test('an approved exact Turn request survives restart and is admitted once', asy
           },
         };
       },
+      regenerateTurn: unexpectedRegenerateTurn,
     });
     await coordinator.recover();
     await coordinator.close();
@@ -274,6 +393,65 @@ test('an approved exact Turn request survives restart and is admitted once', asy
   }
 });
 
+test('an approved regeneration request uses the same durable admission boundary', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'maka-session-regenerate-request-'));
+  const authority = await openRuntimeHostAccessAuthority(directory);
+  try {
+    const principalId = await activateTurnGuest(authority);
+    const intent = {
+      sessionId: 'session-1',
+      turnId: 'turn-regenerated',
+      sourceTurnId: 'turn-original',
+    };
+    const request = await authority.createTurnAccessRequest(principalId, { intent });
+    const equivalent = await authority.createTurnAccessRequest(principalId, {
+      intent: { ...intent, turnId: 'another-client-attempt' },
+    });
+    assert.equal(equivalent.requestId, request.requestId);
+    await authority.decideTurnAccessRequest('local_owner', {
+      requestId: request.requestId,
+      decision: 'approve',
+    });
+    const admitted: unknown[] = [];
+    const coordinator = new SessionTurnAccessRequestCoordinator({
+      authority,
+      hostEpoch: 'epoch-1',
+      acquireResidency: () => ({ release: () => undefined }),
+      requestDrain: () => undefined,
+      whenIdle: () => undefined,
+      startTurn: async () => {
+        throw new Error('Regeneration must not use turn.start');
+      },
+      regenerateTurn: async (input) => {
+        admitted.push(input);
+        return {
+          ok: true,
+          result: {
+            sessionId: input.sessionId,
+            turnId: input.turnId,
+            runId: 'run-regenerated',
+            status: 'running',
+          },
+        };
+      },
+    });
+    coordinator.recover();
+    await coordinator.close();
+
+    assert.deepEqual(admitted, [intent]);
+    const completed = authority.queryTurnAccessRequests(LOCAL_OWNER, {
+      sessionId: 'session-1',
+    }).requests[0];
+    assert.equal(
+      completed?.state.kind === 'approved' ? completed.state.admission : undefined,
+      'started',
+    );
+  } finally {
+    await authority.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('Turn access request creation is idempotent for one exact Guest intent', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'maka-session-turn-request-idempotent-'));
   const authority = await openRuntimeHostAccessAuthority(directory);
@@ -295,7 +473,7 @@ test('Turn access request creation is idempotent for one exact Guest intent', as
       authority.createTurnAccessRequest(principalId, {
         intent: { ...intent, content: { text: 'Different work' } },
       }),
-      /different content/u,
+      /different intent/u,
     );
   } finally {
     await authority.close();
@@ -497,6 +675,7 @@ test('recovery stays ready while an approved Turn request waits for the Session'
               },
             };
       },
+      regenerateTurn: unexpectedRegenerateTurn,
     });
     coordinator.recover();
     assert.equal(attempts, 1);
@@ -553,6 +732,7 @@ test('an idle-wait failure drains without losing the approved Turn request', asy
           retryable: true,
         },
       }),
+      regenerateTurn: unexpectedRegenerateTurn,
     });
     coordinator.recover();
     await coordinator.close();
@@ -600,6 +780,7 @@ test('drain does not terminalize an in-flight admission failure', async () => {
         started();
         return admission;
       },
+      regenerateTurn: unexpectedRegenerateTurn,
     });
     const request = await authority.createTurnAccessRequest(principalId, {
       intent: {

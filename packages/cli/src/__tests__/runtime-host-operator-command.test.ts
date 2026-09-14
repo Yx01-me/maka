@@ -473,6 +473,10 @@ describe('Runtime Host operator commands', () => {
         'access.principal.revoke',
         'collaboration.turn-request.acknowledge',
         'collaboration.turn-request.create',
+        'collaboration.turn-request.withdraw',
+        'external_agents.setup.cancel',
+        'external_agents.setup.query',
+        'external_agents.setup.start',
         'host.upgrade.prepare',
         'hosted.execution.cancel',
         'hosted.execution.start',
@@ -494,6 +498,10 @@ describe('Runtime Host operator commands', () => {
         'plugin.package.uninstall',
         'plugin.platform.query',
         'plugin.platform.reconcile',
+        // Host-path operations: they name a path on the Host's filesystem, and
+        // these presets are `canUseHostPaths: false`.
+        'session-bundle.export',
+        'session-bundle.import',
       ],
     );
   });
@@ -506,8 +514,19 @@ describe('Runtime Host operator commands', () => {
       websocketEndpoints: ['wss://runtime.example.com:443/runtime-host'],
       peerListeners: [
         {
-          peerId: '12D3KooWPeer',
-          listenAddresses: ['/ip4/192.0.2.10/udp/4001/quic-v1/p2p/12D3KooWPeer'],
+          reachability: {
+            lease: {
+              version: 1,
+              peerId: '12D3KooWPeer',
+              revision: 1,
+              issuedAt: 1,
+              expiresAt: 2,
+              directRoutes: ['/ip4/192.0.2.10/udp/4001/quic-v1/p2p/12D3KooWPeer'],
+              coordinationRoutes: [],
+            },
+            publicKey: 'cHVibGlj',
+            signature: 'c2lnbmF0dXJl',
+          },
         },
       ],
       compositionDescriptor: { id: 'maka.interactive', revision: '2' },

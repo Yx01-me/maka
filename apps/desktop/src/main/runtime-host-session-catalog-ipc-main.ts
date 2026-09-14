@@ -24,18 +24,22 @@ import { isPermissionMode } from '@maka/core/permission';
 import { isThinkingLevel, type ThinkingLevel } from '@maka/core/model-thinking';
 import { type CreateSessionRequestInput, type SessionListFilter } from '@maka/core/runtime-inputs';
 import { type SessionChangedEvent, type SessionChangedReason, type SessionCatalogSummary } from '@maka/core/session';
-import { projectSessionCatalogSummary } from '@maka/runtime-host/client';
+import { RuntimeHostOperationError, projectSessionCatalogSummary } from '@maka/runtime-host/client';
 import type {
   SessionCatalogProjection,
-  SharedSessionCatalogProjection,
   SessionCreateInput,
   WorkspaceTarget,
   SessionModelTarget,
 } from '@maka/runtime-host/protocol';
-import { resolveCreateSessionRequest } from './create-session-input.js';
 import type {
-  DesktopRuntimeHostClient,
-  DesktopSessionConfigurationPatch,
+  DesktopSessionUpdateFailureCode,
+  DesktopSessionUpdateResult,
+} from '../shared/desktop-session-projection.js';
+import { resolveCreateSessionRequest } from './create-session-input.js';
+import {
+  type DesktopRuntimeHostClient,
+  DesktopRuntimeHostClientError,
+  type DesktopSessionConfigurationPatch,
 } from './runtime-host-client.js';
 import {
   requestsRevisionFamily,
@@ -60,6 +64,7 @@ type RuntimeHostSessionCatalogClient = Pick<
 >;
 
 export interface DesktopHostSessionSummary extends SessionCatalogSummary {
+  revision: number;
   labelsTruncated: boolean;
   shared?: true;
 }
@@ -79,10 +84,6 @@ export interface RuntimeHostSessionCatalogIpcDeps {
   releaseSessionResources: (sessionId: string) => void | Promise<void>;
   sessionCopyCleanup: SessionCopyCleanupAuthority;
   newId?: () => string;
-}
-
-export interface RuntimeHostSharedSessionCatalogIpcDeps {
-  getSession(): Promise<DesktopHostSessionSummary | null>;
 }
 
 export function registerRuntimeHostSessionCatalogIpc(
@@ -123,26 +124,11 @@ export function registerRuntimeHostSessionCatalogIpc(
     pendingCleanup.add(sessionId);
   });
   ipcMain.handle('sessions:create', async (_event, input?: CreateSessionRequestInput) => {
-    const request = resolveCreateSessionRequest(input);
     const workspace = await deps.resolveCreateProject({
       ...(input?.cwd === undefined ? {} : { cwd: input.cwd }),
       ...(input?.projectId === undefined ? {} : { projectId: input.projectId }),
     });
-    const session = await deps.client.createSession({
-      sessionId: newId(),
-      workspace,
-      ...(request.mode === undefined ? {} : { mode: request.mode }),
-      // A nameless mode (`bot`) keeps the caller's name, so always forward it.
-      name: request.name,
-      ...(request.labels === undefined ? {} : { labels: request.labels }),
-      modelTarget: normalizeModelTarget(input),
-      ...normalizeCreateThinkingLevel(input?.thinkingLevel),
-      ...(request.mode !== undefined || request.permissionMode === undefined
-        ? {}
-        : { permissionMode: request.permissionMode }),
-      collaborationMode: request.collaborationMode,
-      orchestrationMode: request.orchestrationMode,
-    });
+    const session = await deps.client.createSession(resolveDesktopSessionCreateInput(input, newId(), workspace));
     deps.emitSessionsChanged('created', session.id);
     return toDesktopHostSessionSummary(session);
   });
@@ -237,50 +223,6 @@ export function registerRuntimeHostSessionCatalogIpc(
   });
 }
 
-export function registerRuntimeHostSharedSessionCatalogIpc(
-  deps: RuntimeHostSharedSessionCatalogIpcDeps,
-  ipcMain: ReconnectableReadIpcMain,
-): void {
-  handleReconnectableRead(ipcMain, 'sessions:list', async (_event, filter?: unknown) => {
-    if (normalizeSessionListFilter(filter)?.subagentParentSessionId) return [];
-    const session = await deps.getSession();
-    return session ? [session] : [];
-  });
-}
-
-export function toDesktopHostSharedSessionSummary(
-  session: SharedSessionCatalogProjection,
-): DesktopHostSessionSummary {
-  return {
-    id: session.id,
-    name: session.name,
-    activityAt: session.activityAt,
-    isFlagged: false,
-    isArchived: false,
-    labels: [],
-    labelsTruncated: false,
-    hasUnread: false,
-    ...(session.lastMessageAt === undefined ? {} : { lastMessageAt: session.lastMessageAt }),
-    ...(session.lastMessagePreview === undefined
-      ? {}
-      : { lastMessagePreview: session.lastMessagePreview }),
-    status: session.status,
-    ...(session.liveRunState === undefined
-      ? {}
-      : { runningTurnIds: [...session.liveRunState.runningTurnIds] }),
-    ...(session.blockedReason === undefined ? {} : { blockedReason: session.blockedReason }),
-    ...(session.statusUpdatedAt === undefined
-      ? {}
-      : { statusUpdatedAt: session.statusUpdatedAt }),
-    backend: 'ai-sdk',
-    llmConnectionSlug: '',
-    connectionLocked: true,
-    model: '',
-    permissionMode: 'ask',
-    shared: true,
-  };
-}
-
 /**
  * Reads the archived premise off the remove options.
  *
@@ -319,10 +261,35 @@ async function updateConfiguration(
   patch: DesktopSessionConfigurationPatch,
   reason: SessionChangedReason,
   extra?: Pick<SessionChangedEvent, 'modelId' | 'turnId'>,
-): Promise<DesktopHostSessionSummary> {
-  const session = await deps.client.updateSessionConfiguration(sessionId, patch);
+): Promise<DesktopSessionUpdateResult<DesktopHostSessionSummary>> {
+  let session: SessionCatalogProjection;
+  try {
+    session = await deps.client.updateSessionConfiguration(sessionId, patch);
+  } catch (error) {
+    const code = updateFailureCode(error);
+    if (code) return { ok: false, code };
+    throw error;
+  }
   deps.emitSessionsChanged(reason, sessionId, extra);
-  return toDesktopHostSessionSummary(session);
+  return { ok: true, session: toDesktopHostSessionSummary(session) };
+}
+
+const EXPECTED_UPDATE_FAILURES = [
+  'session_busy',
+  'operation_conflict',
+  'operation_unavailable',
+  'not_found',
+] as const;
+
+function updateFailureCode(error: unknown): DesktopSessionUpdateFailureCode | undefined {
+  if (error instanceof RuntimeHostOperationError) {
+    return EXPECTED_UPDATE_FAILURES.find((code) => code === error.code);
+  }
+  if (error instanceof DesktopRuntimeHostClientError) {
+    if (error.code === 'revision_conflict') return 'operation_conflict';
+    if (error.code === 'session_not_found') return 'not_found';
+  }
+  return undefined;
 }
 
 function normalizeParentSessionFilter(value: unknown): string | undefined {
@@ -350,6 +317,30 @@ function normalizeSessionListFilter(value: unknown): SessionListFilter | undefin
             record.subagentParentSessionId,
           ),
         }),
+  };
+}
+
+export function resolveDesktopSessionCreateInput(input: CreateSessionRequestInput | undefined, sessionId: string, workspace: WorkspaceTarget): SessionCreateInput {
+  const request = resolveCreateSessionRequest(input);
+  const executorId = normalizeOptionalString(input?.executorId, 'executor id');
+  if (
+    executorId &&
+    (input?.llmConnectionId !== undefined ||
+      input?.llmConnectionSlug !== undefined ||
+      input?.model !== undefined)
+  ) {
+    throw new Error('Plugin executor selection cannot include a model target');
+  }
+  return {
+    sessionId, workspace,
+    ...(request.mode === undefined ? {} : { mode: request.mode }),
+    name: request.name,
+    ...(request.labels === undefined ? {} : { labels: request.labels }),
+    ...(executorId ? { executorId } : { modelTarget: normalizeModelTarget(input) }),
+    ...normalizeCreateThinkingLevel(input?.thinkingLevel),
+    ...(request.mode !== undefined || request.permissionMode === undefined ? {} : { permissionMode: request.permissionMode }),
+    collaborationMode: request.collaborationMode,
+    orchestrationMode: request.orchestrationMode,
   };
 }
 
@@ -405,6 +396,7 @@ export function toDesktopHostSessionSummary(
 ): DesktopHostSessionSummary {
   return {
     ...projectSessionCatalogSummary(session),
+    revision: session.revision,
     labelsTruncated: session.labelsTruncated,
   };
 }

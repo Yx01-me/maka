@@ -17,7 +17,11 @@
  * under the License.
  */
 
-import { decodeConnectionSlug, RuntimePolicyDomainDecodeError } from '@maka/core/runtime-policy';
+import {
+  decodeConnectionName,
+  decodeConnectionSlug,
+  RuntimePolicyDomainDecodeError,
+} from '@maka/core/runtime-policy';
 import {
   requireEntityId,
   requireExactRecord,
@@ -32,7 +36,7 @@ export const OAUTH_PRESENTATION_SERVICE_ID = 'oauth_presentation';
 export const OAUTH_PRESENTATION_SERVICE_VERSION = '1';
 export const OAUTH_PRESENTATION_URL_MAX_LENGTH = 8_192;
 export const OAUTH_PRESENTATION_STATE_HINT_MAX_LENGTH = 1_024;
-export const OAUTH_LOGIN_PROVIDERS = ['openai-codex', 'xai-oauth'] as const;
+export const OAUTH_LOGIN_PROVIDERS = ['openai-codex', 'xai-oauth', 'github-copilot'] as const;
 export const OAUTH_LOGIN_PHASES = [
   'awaiting_authorization',
   'exchanging',
@@ -45,6 +49,7 @@ export const OAUTH_LOGIN_FAILURE_CODES = [
   'capability_unavailable',
   'authorization_failed',
   'provider_rejected',
+  'slug_taken',
   'credential_changed',
   'connection_changed',
   'persistence_failed',
@@ -61,6 +66,7 @@ const COMMON_ERRORS = [
 const START_ERRORS = [
   ...COMMON_ERRORS,
   'operation_conflict',
+  'slug_taken',
   'capability_unavailable',
   'not_found',
   'persistence_failed',
@@ -90,13 +96,35 @@ export interface OAuthLoginProjection {
   readonly failure?: OAuthLoginFailureCode;
 }
 
+export interface OAuthEnrollmentQueryInput {
+  readonly provider: OAuthLoginProvider;
+}
+
+// The Host is the sole authority on whether a provider may enrol on this
+// install; the renderer asks rather than keeping a second copy of the gate.
+export interface OAuthEnrollmentProjection {
+  readonly provider: OAuthLoginProvider;
+  readonly enabled: boolean;
+}
+
 export interface OAuthLoginStartInput {
   readonly attemptId: string;
   readonly target: OAuthLoginTarget;
 }
 
 export type OAuthLoginTarget =
-  | { readonly kind: 'create'; readonly providerType: OAuthLoginProvider }
+  | {
+      readonly kind: 'create';
+      readonly providerType: 'openai-codex';
+      readonly slug?: string;
+      readonly name?: string;
+    }
+  | {
+      readonly kind: 'create';
+      readonly providerType: Exclude<OAuthLoginProvider, 'openai-codex'>;
+      readonly slug?: never;
+      readonly name?: never;
+    }
   | { readonly kind: 'existing'; readonly connectionId: string };
 
 export interface OAuthConnectionIdentity {
@@ -146,6 +174,17 @@ export const OAUTH_OPERATION_SPECS = {
     decodeOutput: decodeOAuthLoginProjection,
     assertOutputForInput: assertOAuthAttemptOutput,
   }),
+  'oauth.enrollment.query': defineOperation<
+    OAuthEnrollmentQueryInput,
+    OAuthEnrollmentProjection,
+    (typeof COMMON_ERRORS)[number]
+  >({
+    mode: 'query',
+    availability: 'ready',
+    errors: COMMON_ERRORS,
+    decodeInput: decodeOAuthEnrollmentQueryInput,
+    decodeOutput: decodeOAuthEnrollmentProjection,
+  }),
 } as const;
 
 export function decodeOAuthLoginStartInput(value: unknown): OAuthLoginStartInput {
@@ -159,6 +198,25 @@ export function decodeOAuthLoginStartInput(value: unknown): OAuthLoginStartInput
 export function decodeOAuthLoginAttemptInput(value: unknown): OAuthLoginAttemptInput {
   const input = requireExactRecord(value, 'OAuth login attempt input', ['attemptId']);
   return { attemptId: requireEntityId(input.attemptId, 'attemptId') };
+}
+
+export function decodeOAuthEnrollmentQueryInput(value: unknown): OAuthEnrollmentQueryInput {
+  const input = requireExactRecord(value, 'OAuth enrollment query input', ['provider']);
+  return { provider: oauthLoginProvider(input.provider) };
+}
+
+export function decodeOAuthEnrollmentProjection(value: unknown): OAuthEnrollmentProjection {
+  const projection = requireExactRecord(value, 'OAuth enrollment projection', [
+    'provider',
+    'enabled',
+  ]);
+  if (typeof projection.enabled !== 'boolean') {
+    throw invalidProtocolFrame('Invalid OAuth enrollment projection');
+  }
+  return {
+    provider: oauthLoginProvider(projection.provider),
+    enabled: projection.enabled,
+  };
 }
 
 export function decodeOAuthLoginProjection(value: unknown): OAuthLoginProjection {
@@ -182,8 +240,31 @@ export function decodeOAuthLoginProjection(value: unknown): OAuthLoginProjection
 function decodeOAuthLoginTarget(value: unknown): OAuthLoginTarget {
   const target = requireRecord(value, 'OAuth login target');
   if (target.kind === 'create') {
-    const exact = requireExactRecord(target, 'OAuth create target', ['kind', 'providerType']);
-    return { kind: 'create', providerType: oauthLoginProvider(exact.providerType) };
+    const exact = requireShapedRecord(
+      target,
+      'OAuth create target',
+      ['kind', 'providerType'],
+      ['slug', 'name'],
+    );
+    const providerType = oauthLoginProvider(exact.providerType);
+    if (providerType !== 'openai-codex') {
+      if (exact.slug !== undefined || exact.name !== undefined) {
+        throw invalidProtocolFrame(
+          'Custom OAuth Connection identity is only supported for openai-codex',
+        );
+      }
+      return { kind: 'create', providerType };
+    }
+    return {
+      kind: 'create',
+      providerType,
+      ...(exact.slug === undefined
+        ? {}
+        : { slug: decodeDomain(() => decodeConnectionSlug(exact.slug)) }),
+      ...(exact.name === undefined
+        ? {}
+        : { name: decodeDomain(() => decodeConnectionName(exact.name)) }),
+    };
   }
   if (target.kind === 'existing') {
     const exact = requireExactRecord(target, 'OAuth existing target', ['kind', 'connectionId']);
@@ -209,7 +290,8 @@ function assertOAuthStartOutput(input: OAuthLoginStartInput, output: OAuthLoginP
   assertOAuthAttemptOutput(input, output);
   if (
     (input.target.kind === 'create' &&
-      output.connection.providerType !== input.target.providerType) ||
+      (output.connection.providerType !== input.target.providerType ||
+        (input.target.slug !== undefined && output.connection.slug !== input.target.slug))) ||
     (input.target.kind === 'existing' &&
       output.connection.connectionId !== input.target.connectionId)
   ) {

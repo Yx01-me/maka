@@ -42,13 +42,13 @@ import { ICON_SIZE, ArrowLeft } from '@maka/ui/icons';
 import type {
   AppSettings,
   RuntimeHostAppSettings,
+  RuntimeHostSettingsUpdateGuard,
   ChatDefaultPermissionMode,
   SettingsSection,
   ThemePalette,
   ThemePreference,
   UpdateAppSettingsResult,
   UsageRange,
-  UsageStats,
 } from '@maka/core/settings';
 import type {
   IdentifiedLlmConnection,
@@ -65,6 +65,7 @@ import type { UiLocalePreference } from '@maka/core/ui-locale';
 import { createDefaultSettings, DEFAULT_APP_ICON } from '@maka/core/settings';
 import { Banner, Selector, useMountedRef, useToast, useUiLocale } from '@maka/ui';
 import { ProvidersPanel } from './providers-panel';
+import { ExternalAgentsSettingsPage } from '../features/external-agent-settings/index.js';
 import { SubagentSettingsPage } from './subagent-settings-page';
 import { safeLocalStorageSet } from '../browser-storage';
 import { ProjectsSettingsPage } from './projects-settings-page';
@@ -87,11 +88,12 @@ import {
 } from './settings-nav';
 import { getSettingsNavigationCopy } from '../locales/settings-navigation-copy.js';
 import { SettingRow } from './settings-rows';
-import { SettingsPage } from './settings-section';
+import { SettingsPage, SettingsSection as SettingsSectionBlock } from './settings-section';
 import { settingsActionErrorMessage } from './settings-error-copy';
+import { SessionBundleTasks } from '../features/session-bundle';
 import { ImportTasksSettingsPage } from './import-tasks-settings-page';
 import { TasksSettingsPage, type ArchivedTasksBridge } from './tasks-settings-page';
-import { UsageSettingsPage } from './usage-settings-page';
+import { UsageScopeMount, UsageSettingsPage, type UsageScopeHandle } from './usage-settings-page';
 import { WebSearchSettingsPage } from './web-search-settings-page';
 import type { UiLocaleUpdateGate } from './ui-locale-update-gate';
 import { getSettingsSharedCopy } from '../locales/settings-shared-copy.js';
@@ -321,19 +323,12 @@ function SettingsSurfaceContent(
   const defaultRuntimeHostProfileIdRef = useRef(
     initialRuntimeHostCatalog?.defaultProfileId,
   );
-  const [usageStats, setUsageStats] = useState<{
-    hostKey: string;
-    epoch: string | undefined;
-    range: UsageRange;
-    value: UsageStats;
-  } | null>(null);
   const [clientLoading, setClientLoading] = useState(initialClientSettings === undefined);
   const settingsModalMountedRef = useMountedRef();
   const clientSettingsTicketRef = useRef(0);
   const [runtimeHostRequestAuthority] = useState(
     () => createSettingsRequestAuthority(initialRuntimeHostKey),
   );
-  const usageReloadTicketRef = useRef(0);
   const runtimeHostReloadTicketRef = useRef(0);
   const runtimeHostCatalogHydratedRef = useRef(false);
   const selectedProfileChangedByUserRef = useRef(
@@ -380,16 +375,35 @@ function SettingsSurfaceContent(
   const selectedRuntimeHostKey = selectedRuntimeHost
     ? runtimeHostSettingsKey(selectedRuntimeHost)
     : undefined;
-  const selectedRuntimeHostKeyRef = useRef(selectedRuntimeHostKey);
-  selectedRuntimeHostKeyRef.current = selectedRuntimeHostKey;
   // A same-key Host can be replaced in place (hostId stable, epoch bumped) on
   // reconnect. `runtimeHostSettingsKey` is epoch-free, so usage must key on the
   // epoch too — otherwise a reconnect clears the page but never refetches.
   const selectedRuntimeHostEpoch = selectedProfileId
     ? runtimeHostLifecycleByProfile.get(selectedProfileId)?.epoch
     : undefined;
-  const selectedRuntimeHostEpochRef = useRef(selectedRuntimeHostEpoch);
-  selectedRuntimeHostEpochRef.current = selectedRuntimeHostEpoch;
+  // Usage feature scope wiring (issue #4425). The Host-scoped stats read and the
+  // settings-update reconciliation are bound here (the `window.maka` bridge path
+  // stays in this file). The scope is mounted above the loading/error gate below,
+  // so a loaded snapshot survives a Skeleton/Banner state or a section change; it
+  // takes `usageTargetKey` (host:epoch) as a prop and clears itself when the
+  // target changes, so a Host/generation change never remounts the rest of the
+  // Settings surface. `usageScopeRef.fenceTarget()` rejects an in-flight old-Host
+  // load synchronously at a Host change, before React re-renders the new target.
+  const usageScopeRef = useRef<UsageScopeHandle>(null);
+  const usageServices = {
+    loadUsageStats: (range: UsageRange) =>
+      selectedRuntimeHost
+        ? window.maka.settings.usageStats(range, selectedRuntimeHost)
+        : Promise.resolve(null),
+    updateUsageSettings: (patch: Partial<AppSettings['usage']>) =>
+      updateSettings({ usage: patch }).then((result) => result.settings.usage),
+  };
+  // `selectedRuntimeHostKey` is the one authority for the `profileId:hostId`
+  // shape (`runtimeHostSettingsKey`); usage keys on it plus the epoch so a
+  // same-key reconnect (epoch bump) still changes the target.
+  const usageTargetKey = selectedRuntimeHostKey
+    ? `${selectedRuntimeHostKey}:${selectedRuntimeHostEpoch ?? ''}`
+    : 'no-host';
   function commitSelectedRuntimeHostProfile(
     profileId: string,
     snapshot = runtimeHosts,
@@ -399,14 +413,8 @@ function SettingsSurfaceContent(
     const nextKey = nextHost ? runtimeHostSettingsKey(nextHost) : undefined;
     // Reject old-Host reads and writes synchronously with the authority
     // change, before React renders the newly selected profile.
-    const targetChanged = runtimeHostRequestAuthority.selectTarget(
-      nextKey,
-      lifecycle?.epoch,
-    );
-    if (targetChanged) {
-      usageReloadTicketRef.current += 1;
-      setUsageStats(null);
-    }
+    const targetChanged = runtimeHostRequestAuthority.selectTarget(nextKey, lifecycle?.epoch);
+    if (targetChanged) usageScopeRef.current?.fenceTarget();
     selectedProfileIdRef.current = profileId;
     setSelectedProfileId(profileId);
   }
@@ -444,7 +452,7 @@ function SettingsSurfaceContent(
     );
     return () => props.onSelectedRuntimeHostProfileIdChange(undefined);
   }, [props.onSelectedRuntimeHostProfileIdChange, selectedProfileId, showsRuntimeHost]);
-  const sectionNeedsSettings = ['general', 'subagents', 'memory', 'search'].includes(section);
+  const sectionNeedsSettings = ['general', 'subagents', 'memory', 'search', 'external-agents'].includes(section);
   const sectionNeedsConnections = ['general', 'models', 'subagents', 'daily-review'].includes(section);
   const runtimeHostAvailabilityStatus: RuntimeHostAvailabilityStatus =
     selectedRuntimeHost
@@ -591,7 +599,10 @@ function SettingsSurfaceContent(
     }
   }
 
-  async function updateSettings(patch: Parameters<typeof window.maka.settings.update>[0]) {
+  async function updateSettings(
+    patch: Parameters<typeof window.maka.settings.update>[0],
+    guard?: RuntimeHostSettingsUpdateGuard,
+  ) {
     const uiLocaleTicket = props.uiLocaleUpdateGate.begin(
       patch.personalization?.uiLocale !== undefined,
     );
@@ -612,7 +623,7 @@ function SettingsSurfaceContent(
         ? undefined
         : ++clientSettingsTicketRef.current;
       const result = host
-        ? await window.maka.settings.update(patch, host)
+        ? await window.maka.settings.update(patch, host, guard)
         : await window.maka.settings.updateClient(patch);
       if (hostTicket && !runtimeHostRequestAuthority.isCurrentTarget(hostTicket)) {
         throw new Error(copy.runtimeHostUnavailable);
@@ -652,39 +663,6 @@ function SettingsSurfaceContent(
     } catch (error) {
       props.uiLocaleUpdateGate.cancel(uiLocaleTicket);
       throw error;
-    }
-  }
-
-  async function reloadUsage(range: UsageRange = settings.usage.range) {
-    const host = selectedRuntimeHost;
-    if (!host) {
-      usageReloadTicketRef.current += 1;
-      setUsageStats(null);
-      return;
-    }
-    const hostKey = runtimeHostSettingsKey(host);
-    const epoch = selectedRuntimeHostEpochRef.current;
-    const ticket = usageReloadTicketRef.current + 1;
-    usageReloadTicketRef.current = ticket;
-    try {
-      const next = await window.maka.settings.usageStats(range, host);
-      if (
-        settingsModalMountedRef.current &&
-        ticket === usageReloadTicketRef.current &&
-        selectedRuntimeHostKeyRef.current === hostKey &&
-        selectedRuntimeHostEpochRef.current === epoch
-      ) {
-        setUsageStats({ hostKey, epoch, range, value: next });
-      }
-    } catch (error) {
-      if (
-        settingsModalMountedRef.current &&
-        ticket === usageReloadTicketRef.current &&
-        selectedRuntimeHostKeyRef.current === hostKey &&
-        selectedRuntimeHostEpochRef.current === epoch
-      ) {
-        toast.error(copy.usageLoadFailed, settingsActionErrorMessage(error, locale));
-      }
     }
   }
 
@@ -753,11 +731,12 @@ function SettingsSurfaceContent(
           // Fence synchronously, before the catalog refresh can resolve. The
           // previous generation's snapshots stay visible but no Host-backed
           // control may treat them as current write authority.
-          usageReloadTicketRef.current += 1;
-          setUsageStats(null);
           setRuntimeHostCatalog(invalidateSettingsResourceGeneration);
           setRuntimeHostSettings(invalidateSettingsResourceGeneration);
           setRuntimeHostConnections(invalidateSettingsResourceGeneration);
+          // Usage is Host-owned: drop its snapshot and fence its in-flight load
+          // here too, so an old-generation load cannot land before the re-render.
+          usageScopeRef.current?.fenceTarget();
         }
       }
       void reloadRuntimeHosts().catch(() => undefined);
@@ -819,14 +798,6 @@ function SettingsSurfaceContent(
     };
   }, [connectionsBridge, selectedRuntimeHost]);
 
-  useEffect(() => {
-    // Usage records are Host-owned while the display preferences remain
-    // client-owned. Refetch when the persisted range arrives, the selected Host
-    // changes, or the selected Host is replaced in place (epoch bump) so labels
-    // and numbers always describe one live Host generation.
-    if (section === 'usage') void reloadUsage(settings.usage.range);
-  }, [section, settings.usage.range, selectedRuntimeHostKey, selectedRuntimeHostEpoch]);
-
   // PR-SETTINGS-HEADER-COPY-MAP-0 (U1): the page header derives its title
   // and description from the section→copy map keyed by the active section,
   // never from a `nav[0]` fallback. A section that is routable but missing
@@ -869,7 +840,7 @@ function SettingsSurfaceContent(
   }
 
   return (
-    <div className="settingsSurface" data-modal="true">
+    <div className="settingsSurface" data-modal="true" data-maka-assistant-section={section}>
       <Layout
         height="fill"
         padding={0}
@@ -888,6 +859,7 @@ function SettingsSurfaceContent(
               topContent={(
                 isNarrowSettings
                   ? <IconButton
+                      data-maka-assistant-target="settings.close"
                       variant="ghost"
                       label={copy.backToApp}
                       tooltip={copy.backToApp}
@@ -895,6 +867,7 @@ function SettingsSurfaceContent(
                       onClick={props.onClose}
                     />
                   : <Button
+                      data-maka-assistant-target="settings.close"
                       className="settingsBackButton"
                       variant="ghost"
                       width="100%"
@@ -909,6 +882,7 @@ function SettingsSurfaceContent(
                   {items.map((item) => (
                     <SideNavItem
                       key={item.id}
+                      data-maka-assistant-target={`settings.${item.id}`}
                       label={item.label}
                       icon={<item.Icon size={ICON_SIZE.chrome} aria-hidden="true" />}
                       isSelected={section === item.id}
@@ -979,6 +953,13 @@ function SettingsSurfaceContent(
               )}
               content={(
                 <LayoutContent padding={6} isScrollable={false}>
+                  <UsageScopeMount
+                    ref={usageScopeRef}
+                    targetKey={usageTargetKey}
+                    services={usageServices}
+                    loadErrorTitle={copy.usageLoadFailed}
+                    describeError={(error) => settingsActionErrorMessage(error, locale)}
+                  >
                   {loading ? (
                     <SettingsSkeleton />
                   ) : requiresRuntimeHost &&
@@ -1030,15 +1011,11 @@ function SettingsSurfaceContent(
                         >
                           <SettingsPageBody
                             section={section}
+                            // A bundle names a path on THIS machine, so the
+                            // feature is offered only while the Local Host is
+                            // the target -- never beside a Remote one.
+                            isLocalRuntimeHost={selectedRuntimeHostEntry?.profile.kind === 'local'}
                             settings={settings}
-                            usageStats={
-                              usageStats &&
-                              usageStats.hostKey === selectedRuntimeHostKey &&
-                              usageStats.epoch === selectedRuntimeHostEpoch &&
-                              usageStats.range === settings.usage.range
-                                ? usageStats.value
-                                : null
-                            }
                             connections={connections}
                             connectionsBridge={connectionsBridge}
                             apiKeyOnboardingBridge={apiKeyOnboardingBridge}
@@ -1058,7 +1035,6 @@ function SettingsSurfaceContent(
                             onReloadSettings={reloadRuntimeHostSettings}
                             onReloadClientSettings={reloadClientSettings}
                             onRetryRuntimeHost={retryRuntimeHostContent}
-                            onReloadUsage={reloadUsage}
                             onThemeChange={props.onThemeChange}
                             onThemePaletteChange={props.onThemePaletteChange}
                             onOpenDailyReview={props.onOpenDailyReview}
@@ -1081,6 +1057,7 @@ function SettingsSurfaceContent(
                       </RuntimeHostSettingsTarget>
                     </>
                   )}
+                  </UsageScopeMount>
                 </LayoutContent>
               )}
             />
@@ -1093,8 +1070,8 @@ function SettingsSurfaceContent(
 
 function SettingsPageBody(props: {
   section: SettingsSection;
+  isLocalRuntimeHost: boolean;
   settings: AppSettings;
-  usageStats: UsageStats | null;
   connections: ProjectedLlmConnection[];
   connectionsBridge: RuntimeHostSettingsConnectionsBridge | undefined;
   apiKeyOnboardingBridge:
@@ -1112,11 +1089,13 @@ function SettingsPageBody(props: {
   themePref: ThemePreference;
   themePalette: ThemePalette;
   onRefreshConnections(): Promise<void>;
-  onUpdateSettings(patch: Parameters<typeof window.maka.settings.update>[0]): Promise<UpdateAppSettingsResult>;
+  onUpdateSettings(
+    patch: Parameters<typeof window.maka.settings.update>[0],
+    guard?: RuntimeHostSettingsUpdateGuard,
+  ): Promise<UpdateAppSettingsResult>;
   onReloadSettings(): Promise<void>;
   onReloadClientSettings(): Promise<void>;
   onRetryRuntimeHost(): Promise<void>;
-  onReloadUsage(range?: UsageRange): Promise<void>;
   onThemeChange(pref: ThemePreference): void;
   onThemePaletteChange(palette: ThemePalette): void;
   onOpenDailyReview?(): void;
@@ -1155,6 +1134,8 @@ function SettingsPageBody(props: {
           />
         </SettingsPage>
       );
+    case 'external-agents':
+      return <ExternalAgentsSettingsPage settings={props.settings} onUpdate={props.onUpdateSettings} />;
     case 'subagents':
       return (
         <SubagentSettingsPage
@@ -1164,15 +1145,9 @@ function SettingsPageBody(props: {
         />
       );
     case 'usage':
-      return (
-        <UsageSettingsPage
-          settings={props.settings}
-          stats={props.usageStats}
-          onUpdate={props.onUpdateSettings}
-          onReload={props.onReloadUsage}
-          onOpenSession={props.onOpenSession}
-        />
-      );
+      // State lives in the persistent `UsageScopeMount` above the loading gate;
+      // this view is disposable and reads it from context.
+      return <UsageSettingsPage settings={props.settings.usage} onOpenSession={props.onOpenSession} />;
     case 'bot-chat':
       return (
         <BotChatSettingsPage
@@ -1231,10 +1206,21 @@ function SettingsPageBody(props: {
       return <TasksSettingsPage {...props.archivedTasks} />;
     case 'import-tasks':
       return (
-        <ImportTasksSettingsPage
-          onImported={props.onTaskImported}
-          onOpenImported={props.onOpenSession}
-        />
+        <SettingsPage as="section">
+          <SessionBundleTasks
+            isLocalTarget={props.isLocalRuntimeHost}
+            sessions={props.archivedTasks.sessions}
+            renderSection={({ children, ...section }) => (
+              <SettingsSectionBlock {...section}>{children}</SettingsSectionBlock>
+            )}
+          >
+            <ImportTasksSettingsPage
+              onImported={props.onTaskImported}
+              onOpenImported={props.onOpenSession}
+              offersBundleSource={props.isLocalRuntimeHost}
+            />
+          </SessionBundleTasks>
+        </SettingsPage>
       );
     case 'data':
       return (

@@ -26,7 +26,7 @@ import {
   type McpToolProvider,
 } from '@maka/runtime/mcp-tools';
 import { type MakaTool } from '@maka/runtime/tool-runtime';
-import type { RootExecutionDescriptor } from '@maka/core/agent-run';
+import type { RootExecutionDescriptor } from '@maka/core/runtime-invocation';
 import {
   clientCapabilityScopeIdentity,
   type ClientCapabilityGrantTarget,
@@ -45,7 +45,6 @@ import {
 import {
   ClientCapabilityInvocationBroker,
   ClientCapabilityInvocationError,
-  type ClientCapabilityInvocationFailure,
 } from './client-capability-invocation-broker.js';
 import type {
   ClientCapabilityOperationHandlerMap,
@@ -66,6 +65,7 @@ import { clientCapabilityProviderId } from './client-capability-provider-id.js';
 const DEFAULT_CALL_TIMEOUT_MS = 150_000;
 const DESKTOP_BROWSER_SERVER_ID = 'desktop_browser';
 const DESKTOP_SETTINGS_SERVER_ID = 'desktop_settings';
+const DESKTOP_MCP_OFFER_PREFIX = 'desktop_mcp';
 const DESKTOP_BROWSER_TOOLS = new Set([
   'browser_navigate',
   'browser_snapshot',
@@ -77,7 +77,6 @@ const DESKTOP_BROWSER_TOOLS = new Set([
 const DESKTOP_SETTINGS_TOOLS = new Set(['MakaClientSettingsGet', 'MakaClientSettingsUpdate']);
 
 export { ClientCapabilityInvocationError };
-export type { ClientCapabilityInvocationFailure };
 
 export interface ClientCapabilitySnapshot {
   readonly registrationIds: readonly string[];
@@ -149,7 +148,7 @@ type SessionBindingSelection =
   | { readonly ok: false; readonly message: string };
 
 type SessionBindingResult =
-  | { readonly ok: true }
+  | { readonly ok: true; readonly capabilityBinding?: `sha256:${string}` }
   | { readonly ok: false; readonly message: string };
 
 export type SessionBindingPreview<T> =
@@ -269,8 +268,9 @@ export class HostClientCapabilityCoordinator implements ClientCapabilityService 
   async bindSession(
     sessionId: string,
     initiatingConnectionId: string,
-  ): Promise<{ readonly ok: true } | { readonly ok: false; readonly message: string }> {
-    return this.#bindSession(sessionId, initiatingConnectionId, 'strict');
+    requiredToolNames?: readonly string[],
+  ): Promise<SessionBindingResult> {
+    return this.#bindSession(sessionId, initiatingConnectionId, 'strict', requiredToolNames);
   }
 
   async bindSessionSuccessor(sessionId: string): Promise<void> {
@@ -303,14 +303,65 @@ export class HostClientCapabilityCoordinator implements ClientCapabilityService 
     sessionId: string,
     initiatingConnectionId: string,
     mode: SessionBindingMode,
+    requiredToolNames?: readonly string[],
   ): Promise<SessionBindingResult> {
     return this.#activation.runMutation(async () => {
       const selection = this.#selectSessionState(sessionId, initiatingConnectionId, mode);
       if (!selection.ok) return selection;
+      const capabilityBinding = requiredToolNames
+        ? this.#toolProviderBinding(selection.state, requiredToolNames)
+        : undefined;
+      if (requiredToolNames && !capabilityBinding) {
+        return {
+          ok: false,
+          message: 'Required Client Capability tools do not have one available provider',
+        };
+      }
       this.#storeSessionState(sessionId, selection.state);
       if (selection.modelToolsChanged) this.#onModelToolsChanged();
-      return { ok: true };
+      return { ok: true, ...(capabilityBinding ? { capabilityBinding } : {}) };
     });
+  }
+
+  async bindRecoveredSession(
+    sessionId: string,
+    binding: `sha256:${string}`,
+    toolNames: readonly string[],
+  ): Promise<boolean> {
+    return this.#activation.runMutation(() => {
+      const provider = [...this.#providers.values()].find(
+        (candidate) =>
+          providerAuthorityDigest(candidate) === binding && this.#activeConnection(candidate),
+      );
+      if (!provider) return false;
+      const connection = this.#activeConnection(provider)!;
+      const selection = this.#selectSessionState(sessionId, connection.connectionId, 'strict');
+      if (!selection.ok || this.#toolProviderBinding(selection.state, toolNames) !== binding)
+        return false;
+      this.#storeSessionState(sessionId, selection.state);
+      if (selection.modelToolsChanged) this.#onModelToolsChanged();
+      return true;
+    });
+  }
+
+  #toolProviderBinding(
+    state: SessionCapabilityState | undefined,
+    toolNames: readonly string[],
+  ): `sha256:${string}` | undefined {
+    const missing = new Set(toolNames);
+    let selected: ClientProviderState | undefined;
+    for (const [contractId, binding] of state?.sessionBindings ?? []) {
+      if (binding.kind !== 'bound') continue;
+      const provider = this.#providers.get(binding.providerId);
+      const offer = provider?.current?.offersByContract.get(contractId);
+      if (!provider || !this.#activeConnection(provider) || !offer) continue;
+      for (const tool of offer.offer.tools) {
+        if (!missing.delete(mcpProxyToolName(tool.serverId, tool.name))) continue;
+        if (selected && selected !== provider) return undefined;
+        selected = provider;
+      }
+    }
+    return selected && missing.size === 0 ? providerAuthorityDigest(selected) : undefined;
   }
 
   async runWithSessionBindingPreview<T>(
@@ -785,12 +836,15 @@ export class HostClientCapabilityCoordinator implements ClientCapabilityService 
   }
 
   releaseConnection(connectionId: string): Promise<void> {
-    this.#invocations.releaseConnection(connectionId);
+    const invocationCleanup = this.#invocations.releaseConnection(connectionId);
     const connection = this.#connections.get(connectionId);
-    if (!connection) return Promise.resolve();
+    if (!connection) return invocationCleanup;
     let task!: Promise<void>;
-    task = this.#activation
-      .runMutation(() => this.#releaseConnectionState(connection))
+    task = Promise.all([
+      invocationCleanup,
+      this.#activation.runMutation(() => this.#releaseConnectionState(connection)),
+    ])
+      .then(() => undefined)
       .finally(() => this.#pendingConnectionReleases.delete(task));
     this.#pendingConnectionReleases.add(task);
     void task.catch(() => undefined);
@@ -827,9 +881,10 @@ export class HostClientCapabilityCoordinator implements ClientCapabilityService 
 
   async close(): Promise<void> {
     this.beginDrain();
-    for (const connectionId of [...this.#connections.keys()]) {
-      this.releaseConnection(connectionId);
-    }
+    const releases = [...this.#connections.keys()].map((connectionId) =>
+      this.releaseConnection(connectionId),
+    );
+    await Promise.allSettled(releases);
     await Promise.allSettled([...this.#pendingConnectionReleases]);
     this.#invocations.close();
     this.#sessions.clear();
@@ -1069,7 +1124,8 @@ export class HostClientCapabilityCoordinator implements ClientCapabilityService 
             );
             if (!target) {
               return {
-                execute: ({ emitProgress } = {}) => prepared.admit(emitProgress),
+                execute: ({ emitProgress, requestInteraction } = {}) =>
+                  prepared.admit(emitProgress, requestInteraction),
                 cancel: () => prepared.cancel(),
               };
             }
@@ -1090,7 +1146,8 @@ export class HostClientCapabilityCoordinator implements ClientCapabilityService 
             }
           }
           return {
-            execute: ({ emitProgress } = {}) => prepared.admit(emitProgress),
+            execute: ({ emitProgress, requestInteraction } = {}) =>
+              prepared.admit(emitProgress, requestInteraction),
             cancel: () => prepared.cancel(),
           };
         } catch (error) {
@@ -1108,6 +1165,7 @@ export class HostClientCapabilityCoordinator implements ClientCapabilityService 
           options.signal,
           options.timeoutMs ?? DEFAULT_CALL_TIMEOUT_MS,
           options.emitProgress,
+          options.requestInteraction,
         );
       },
     };
@@ -1497,32 +1555,51 @@ function managedClientCapabilityGrantTarget(
     return undefined;
   }
   if (
-    tool.offerId !== DESKTOP_BROWSER_SERVER_ID ||
-    serverId !== DESKTOP_BROWSER_SERVER_ID ||
-    !DESKTOP_BROWSER_TOOLS.has(toolName)
+    tool.offerId === DESKTOP_BROWSER_SERVER_ID &&
+    serverId === DESKTOP_BROWSER_SERVER_ID &&
+    DESKTOP_BROWSER_TOOLS.has(toolName)
   ) {
-    throw new Error(`Client Capability has no managed admission policy: ${serverId}/${toolName}`);
+    if (evidence.kind !== 'browser_url') {
+      throw new Error('Desktop Browser admission requires URL evidence');
+    }
+    let url: URL;
+    try {
+      url = new URL(evidence.url);
+    } catch {
+      throw new Error('Desktop Browser admission URL is invalid');
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      throw new Error('Desktop Browser admission requires an HTTP origin');
+    }
+    return Object.freeze({
+      providerId: registration.providerId,
+      contractId,
+      serverId,
+      toolName,
+      capability: 'browser',
+      scope: Object.freeze({ kind: 'browser_origin', origin: url.origin }),
+    });
   }
-  if (evidence.kind !== 'browser_url') {
-    throw new Error('Desktop Browser admission requires URL evidence');
+  // Desktop MCP tools publish one offer per MCP server (chunked past the
+  // single-offer tool limit), every offerId carrying the desktop_mcp prefix.
+  // The Session Grant scope takes the descriptor's real MCP server identity.
+  if (
+    tool.offerId === DESKTOP_MCP_OFFER_PREFIX ||
+    tool.offerId.startsWith(`${DESKTOP_MCP_OFFER_PREFIX}_`)
+  ) {
+    if (evidence.kind !== 'none') {
+      throw new Error('Desktop MCP admission does not accept scope evidence');
+    }
+    return Object.freeze({
+      providerId: registration.providerId,
+      contractId,
+      serverId,
+      toolName,
+      capability: 'desktop_mcp',
+      scope: Object.freeze({ kind: 'mcp_tool', serverId, toolName }),
+    });
   }
-  let url: URL;
-  try {
-    url = new URL(evidence.url);
-  } catch {
-    throw new Error('Desktop Browser admission URL is invalid');
-  }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
-    throw new Error('Desktop Browser admission requires an HTTP origin');
-  }
-  return Object.freeze({
-    providerId: registration.providerId,
-    contractId,
-    serverId,
-    toolName,
-    capability: 'browser',
-    scope: Object.freeze({ kind: 'browser_origin', origin: url.origin }),
-  });
+  throw new Error(`Client Capability has no managed admission policy: ${serverId}/${toolName}`);
 }
 
 function serviceContract(serviceId: string, version: string): string {
@@ -1720,4 +1797,21 @@ function sessionCapabilityStatesEqual(
 
 function asError(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
+}
+
+/** Registration IDs and connections rotate; authenticated provider authority must not. */
+function providerAuthorityDigest(provider: ClientProviderState): `sha256:${string}` {
+  return `sha256:${createHash('sha256')
+    .update(
+      JSON.stringify([
+        'maka.client-capability-authority.v1',
+        provider.principalKind,
+        provider.principalId,
+        provider.clientInstanceId,
+        provider.credentialBoundClientInstanceId ?? null,
+        provider.capabilityOwner?.principalId ?? null,
+        provider.capabilityOwner?.clientInstanceId ?? null,
+      ]),
+    )
+    .digest('hex')}`;
 }

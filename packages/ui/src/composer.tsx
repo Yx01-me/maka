@@ -37,6 +37,7 @@ import { useMountedRef } from './use-mounted-ref.js';
 import {
   ICON_SIZE,
   ArrowUp,
+  CircleGauge,
   FileText,
   ListTodo,
   Network,
@@ -76,6 +77,7 @@ import {
   fileTransferContainsFiles,
   isChatInputComposing,
   mentionQueryMatches,
+  selectedSkillIds,
   slashCommandQuery,
   skillMentionQuery,
   type ChatInputActionOwner,
@@ -127,7 +129,7 @@ import {
   workspaceFileReferencePositions,
   type WorkspaceFileReferencePosition,
 } from './inline-reference.js';
-import { ComposerMessageQueue } from './composer-message-queue.js';
+import { ComposerMessageQueue, projectComposerMessageQueue } from './composer-message-queue.js';
 
 /** A Skill as the composer offers it: what the `/` menu lists and what a
  * chosen entry writes into the draft. */
@@ -246,6 +248,7 @@ export const Composer = forwardRef<
   ComposerHandle,
   {
     disabled?: boolean;
+    placeholder?: string;
     /**
      * Prevent submission while leaving the draft and recovery controls usable.
      * Hosts use this for configuration failures that the model picker can fix.
@@ -280,6 +283,7 @@ export const Composer = forwardRef<
     continuing?: boolean;
     /** True while the current streaming session is processing a stop request. */
     stopPending?: boolean;
+    pendingMessages?: readonly import('./chat-view.js').TransientUserMessageProjection[];
     queuedMessages?: readonly MessageQueueEntryProjection[];
     queuedMessageRevision?: number;
     /** Promote a queued follow-up into the active Turn (调整方向). */
@@ -313,6 +317,8 @@ export const Composer = forwardRef<
     pendingDirectories?: readonly import('@maka/core/events').DirectoryReference[];
     onRemoveDirectory?(index: number): void;
     onAttachFilePaths?(files: File[]): void | Promise<void>;
+    /** Hosts that can submit context without a text prompt opt in. */
+    allowAttachmentOnlySend?: boolean;
     pendingAttachments?: readonly {
       displayName: string;
       kind: AttachmentRef['kind'];
@@ -346,6 +352,8 @@ export const Composer = forwardRef<
     activeModelLabel?: string;
     activeProviderType?: ProviderType;
     modelChoices?: ChatModelChoice[];
+    /** Maximum input height in the upstream editor's row units. */
+    maxInputRows?: number;
     /** Whether this Session already has conversation history whose provider prompt cache may be rebuilt by a switch. */
     modelSwitchHasHistory?: boolean;
     /** Identity recovery must not present the stale target as a checked, selectable row. */
@@ -397,6 +405,20 @@ export const Composer = forwardRef<
     noModelConnection?: boolean;
     /** Optional Host-aware replacement for the generic no-model hint. */
     noModelHint?: string;
+    /** Read-only usage indicator for the active model's latest request. */
+    contextUsage?: {
+      usageTokens?: number;
+      declaredContextWindow?: number;
+      /**
+       * The window the usage number was metered against, frozen at call time.
+       * When present it outranks the metadata window, so a live reading keeps
+       * its numerator and denominator from the same request.
+       */
+      meteredContextWindow?: number;
+      metadataContextWindow?: number;
+      /** Open the Host-owned trace surface for this readout. */
+      onOpen(): void;
+    };
     /**
      * Optional edit-and-resend banner above the composer. Desktop owns the
      * revision draft; Composer only renders the notice + cancel affordance.
@@ -415,6 +437,8 @@ export const Composer = forwardRef<
      * the moment the first message creates the session.
      */
     workspacePicker?: WorkspacePickerModel;
+    /** Host actions that share the composer's existing footer. */
+    footerAccessory?: ReactNode;
     /**
      * PR-MOVE-PERMISSION-MODE (WAWQAQ 47fe0d0e + a667cf6c): the
      * permission mode picker lives inside the composer left-controls
@@ -554,6 +578,8 @@ export const Composer = forwardRef<
    * identity so neither hook re-runs an effect when the draft changes.
    */
   const caretToEndRef = useRef(false);
+  /** A caret-to-end owed to an editor that was not focused when it came due. */
+  const caretPendingRef = useRef(false);
   const redrawPendingRef = useRef(false);
   const textPortRef = useRef<ComposerTextPort>(null);
   if (!textPortRef.current) {
@@ -578,10 +604,27 @@ export const Composer = forwardRef<
    * say) then landed the caret at offset 0, so typing prepended to the restored
    * draft. Collapse to the end here when the editor holds no selection of its
    * own, which is what the retired `focusTextInputAtEnd` did unconditionally.
+   *
+   * Only on a focused editor, though. A selection inside a `contenteditable` is
+   * never only a caret: the browser focuses the element to carry it, whatever
+   * held focus before — measured in the shipping runtime, a selection placed
+   * here takes focus from a focused button exactly as it takes it from `body` —
+   * and sequential focus navigation then resumes from the selection rather than
+   * from the top of the document. So a restored draft claimed focus nobody
+   * directed at it: on a cold start, tens of milliseconds in, past the skip link
+   * and with no `focus()` call to explain it; and on a session swap, out from
+   * under the sidebar row the user had just activated. Hold the caret while the
+   * editor is not focused and land it on the editor's next real focus, which is
+   * the first moment the offset is the only thing being decided.
    */
   function caretToContentEnd() {
     const editable = editableNode();
     if (!editable) return;
+    if (document.activeElement !== editable) {
+      caretPendingRef.current = true;
+      return;
+    }
+    caretPendingRef.current = false;
     const selection = document.getSelection();
     const range = document.createRange();
     range.selectNodeContents(editable);
@@ -596,6 +639,30 @@ export const Composer = forwardRef<
     if (!editable || (selection?.anchorNode && editable.contains(selection.anchorNode))) return;
     caretToContentEnd();
   }
+  /**
+   * Settle a held caret when focus reaches the editor for real. On the component
+   * root, like the other native listeners here: `focusin` and `pointerdown`
+   * bubble, and a disabled composer renders no editable to look up at mount.
+   *
+   * A pointer press places the caret itself and is the more specific intent, so
+   * it drops the claim rather than being overruled by it.
+   */
+  useEffect(() => {
+    const root = inputRootRef.current;
+    if (!root) return undefined;
+    const land = () => {
+      if (caretPendingRef.current) caretToContentEnd();
+    };
+    const drop = () => {
+      caretPendingRef.current = false;
+    };
+    root.addEventListener('focusin', land);
+    root.addEventListener('pointerdown', drop);
+    return () => {
+      root.removeEventListener('focusin', land);
+      root.removeEventListener('pointerdown', drop);
+    };
+  }, []);
   /**
    * The ＋ menu's Skills entry opens the same `/` menu the keyboard opens: it
    * types the trigger for the user. There is no second Skill surface to keep in
@@ -727,13 +794,27 @@ export const Composer = forwardRef<
    * The redraw gets the same treatment for the same reason, and can land a
    * render later than the write that owed it: `insertToken` parks the selection
    * after the last chip it wrote, so the caret has to be collected again.
+   *
+   * A held caret is suspended across the redraw rather than left armed. The
+   * redraw drives `insertToken` through the document selection, and its first
+   * range focuses the editor — which would otherwise fire the focus lander onto
+   * the very range the redraw is holding, collapsing it to the end so the chip
+   * landed at the end and its source text stayed in the draft. The redraw ends
+   * by collecting the caret itself, so on success the claim is settled; on a
+   * pass that redrew nothing it is handed back untouched.
    */
   useEffect(() => {
     let restoreCaret = caretToEndRef.current;
     caretToEndRef.current = false;
-    if (redrawPendingRef.current && redrawSkillTokens()) {
-      redrawPendingRef.current = false;
-      restoreCaret = true;
+    if (redrawPendingRef.current) {
+      const heldCaret = caretPendingRef.current;
+      caretPendingRef.current = false;
+      const redrew = redrawSkillTokens();
+      caretPendingRef.current = redrew ? false : heldCaret;
+      if (redrew) {
+        redrawPendingRef.current = false;
+        restoreCaret = true;
+      }
     }
     if (restoreCaret) caretToContentEnd();
   });
@@ -885,6 +966,7 @@ export const Composer = forwardRef<
       }
       const commandQuery = slashCommandQuery(textBeforeCaret, textAfterCaret, rawQuery);
       const query = skillMentionQuery(rawQuery);
+      const selectedSkills = selectedSkillIds(textPort.getValue(), rawQuery);
       const commandItems = commandQuery === null
         ? []
         : (source.slashCommands ?? [])
@@ -904,6 +986,7 @@ export const Composer = forwardRef<
               } satisfies ComposerSlashSuggestion,
             }));
       const skillItems = skills
+        .filter((skill) => !selectedSkills.has(skill.id.toLowerCase()))
         .filter((skill) =>
           mentionQueryMatches(query, `${skill.id} ${skill.name} ${skill.description ?? ''}`),
         )
@@ -1182,6 +1265,15 @@ export const Composer = forwardRef<
     [],
   );
 
+  // Sendable content is a non-empty draft *or* staged structured context:
+  // a pure quote send is a real message (#4804). Attachment-only sends stay
+  // on the Host opt-in (`allowAttachmentOnlySend`), so the upstream flag
+  // governs that half while staged quotes pass the same gates (send handler,
+  // disabled state, send/stop toggle) as text.
+  const hasStagedContext =
+    (props.pendingQuotes?.length ?? 0) > 0 ||
+    (props.allowAttachmentOnlySend === true && (props.pendingAttachments?.length ?? 0) > 0);
+
   async function sendCurrent(followUpMode?: FollowUpMode) {
     if (
       props.disabled
@@ -1193,7 +1285,7 @@ export const Composer = forwardRef<
     // `text`. The optional metadata below is a send-time rendering snapshot of
     // file chips that still exist in the editor, not a second draft state.
     const text = composerWireText(textPort.getValue());
-    if (!text) return;
+    if (!text.trim() && !hasStagedContext) return;
     const editable = editableNode();
     const workspaceFileReferences = editable ? workspaceFileReferencePositions(editable) : [];
     const submittedDraftKey = activeDraftKey();
@@ -1381,7 +1473,7 @@ export const Composer = forwardRef<
     props.sendBlocked ||
     sendPending ||
     importActionBusy ||
-    !text.trim() ||
+    (!text.trim() && !hasStagedContext) ||
     noModelConnection;
   // The disabled Send is explanatory only in the no-model dead-end; other
   // disabled reasons (empty draft, in-flight import) keep the neutral label.
@@ -1392,10 +1484,16 @@ export const Composer = forwardRef<
   // returns to Send (the host queues it as a follow-up). Stop is not lost in
   // that window: Esc interrupts from the input, which is where the hands already
   // are.
-  const stopShown = props.streaming === true && !text.trim();
-  // The pending plate renders the follow-up queue only: steering entries are
-  // already handed to the active Turn and leave the plate at that moment.
-  const queueCount = props.queuedMessages?.length ?? 0;
+  // Union of two contracts: a blocked send always shows Stop (#4979 — a dead
+  // Send helps nobody), and an unblocked structured-only draft (#4804) shows
+  // Send so the staged context can still be handed over as a follow-up.
+  const stopShown =
+    props.streaming === true
+    && (props.sendBlocked === true || (!text.trim() && !hasStagedContext));
+  // A Host receipt is not model consumption. Keep steering above the composer
+  // until the host surface retires its transient on steering_message.
+  const queuedMessages = projectComposerMessageQueue(props.queuedMessages ?? [], props.pendingMessages ?? []);
+  const queueCount = queuedMessages.length;
   const modelChipLabel = props.modelLabel?.trim() || copy.selectModel;
   // Mid-turn the model and thinking menus stay mounted but locked, each
   // carrying the reason in its own words (model vs thinking level) — the
@@ -1599,7 +1697,7 @@ export const Composer = forwardRef<
       )}
       {!props.hidden && queueCount > 0 ? (
           <ComposerMessageQueue
-            queuedMessages={props.queuedMessages!}
+            queuedMessages={queuedMessages}
             queueRevision={props.queuedMessageRevision}
           copy={copy}
           onPromoteEntry={props.onPromoteQueuedEntry}
@@ -1770,9 +1868,9 @@ export const Composer = forwardRef<
                 className="maka-composer-editor"
                 value={text}
                 onChange={onInputChange}
-                placeholder={copy.placeholder}
+                placeholder={props.placeholder ?? copy.placeholder}
                 label={copy.textareaAriaLabel}
-                maxRows={COMPOSER_MAX_ROWS}
+                maxRows={props.maxInputRows ?? COMPOSER_MAX_ROWS}
                 // Prompt history stays ours: persisted, shared across input
                 // surfaces, and clearable from Settings · 数据 (see
                 // use-composer-history.ts).
@@ -2078,6 +2176,7 @@ export const Composer = forwardRef<
                     onChange={props.onNewChatThinkingLevelChange}
                   />
                 )}
+                {props.contextUsage ? <ContextUsageAction {...props.contextUsage} /> : null}
               </div>
               {/* The project decides where a NEW chat starts, which makes it a
                   parameter of this send like the model beside it — so it sits
@@ -2123,6 +2222,7 @@ export const Composer = forwardRef<
                   icon={mark.icon}
                 />
               ))}
+              {props.footerAccessory}
             </div>
           )}
           sendButton={stopShown ? (
@@ -2176,5 +2276,46 @@ export const Composer = forwardRef<
     </>
   );
 });
+
+function ContextUsageAction(props: {
+  usageTokens?: number;
+  declaredContextWindow?: number;
+  meteredContextWindow?: number;
+  metadataContextWindow?: number;
+  onOpen(): void;
+}) {
+  const copy = getConversationCopy(useUiLocale()).messages;
+  // A window from any source is enough to show a share, and the order is a
+  // claim about which window the number was earned against: the user's
+  // declaration first — it is the user's intent, and the only one that arms
+  // the compaction threshold — then the metered window frozen alongside the
+  // usage, so a live reading keeps its numerator and denominator from the
+  // same request, and only then the model's reported metadata. With no window
+  // at all the usage stands on its own.
+  const window =
+    props.declaredContextWindow ?? props.meteredContextWindow ?? props.metadataContextWindow;
+  const label =
+    props.usageTokens !== undefined && window !== undefined && window > 0
+      ? `${Math.round((props.usageTokens / window) * 100)}%`
+      : copy.systemNotes.contextUsageLabel;
+  const tooltip =
+    props.usageTokens === undefined
+      ? copy.systemNotes.contextUsageUnavailable
+      : window !== undefined && window > 0
+        ? copy.systemNotes.contextUsageShare(props.usageTokens, window)
+        : copy.systemNotes.contextUsageNoWindow(props.usageTokens);
+  return (
+    <UiButton
+      variant="ghost"
+      size="sm"
+      icon={<CircleGauge size={ICON_SIZE.meta} aria-hidden="true" />}
+      label={copy.systemNotes.contextUsageOpen}
+      tooltip={tooltip}
+      onClick={props.onOpen}
+    >
+      {label}
+    </UiButton>
+  );
+}
 
 export type ComposerProps = ComponentProps<typeof Composer>;

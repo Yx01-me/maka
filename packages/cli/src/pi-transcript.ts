@@ -18,9 +18,11 @@
  */
 
 import { Markdown, visibleWidth } from '@earendil-works/pi-tui';
+import { resolveReadInput } from '@maka/runtime/read-page';
 import type {
   ProviderRetryEvent,
   ProviderRetryScheduledEvent,
+  FormRequestEvent,
   SandboxBoundaryRequestEvent,
   UserQuestionRequestEvent,
   SessionEvent,
@@ -30,6 +32,7 @@ import type {
 } from '@maka/core/events';
 import {
   deriveTurnRecords,
+  isRuntimeSystemNoteKind,
   STEP_LIMIT_NOTICE_TEXT,
   type StoredMessage,
   type SystemNoteMessage,
@@ -122,7 +125,10 @@ export interface MakaPiTranscriptState {
   providerRetry?: ProviderRetryCountdown;
 }
 
-export type MakaPiPendingInteraction = SandboxBoundaryRequestEvent | UserQuestionRequestEvent;
+export type MakaPiPendingInteraction =
+  | SandboxBoundaryRequestEvent
+  | UserQuestionRequestEvent
+  | FormRequestEvent;
 
 /**
  * A provider retry event plus the CLIENT-local time it was applied. Counting
@@ -936,6 +942,9 @@ export function applyMakaSessionEventToTranscript(
     case 'user_question_request':
       enqueuePendingInteraction(state, event);
       break;
+    case 'form_request':
+      enqueuePendingInteraction(state, event);
+      break;
 
     case 'sandbox_boundary_decision_ack':
       {
@@ -952,6 +961,10 @@ export function applyMakaSessionEventToTranscript(
       break;
 
     case 'user_question_answer_ack':
+      completePendingInteraction(state, event.requestId);
+      break;
+
+    case 'form_answer_ack':
       completePendingInteraction(state, event.requestId);
       break;
 
@@ -1333,24 +1346,65 @@ function tokenDelta(before: number | undefined, after: number | undefined): numb
 }
 
 function systemNoteText(message: SystemNoteMessage): string | undefined {
+  // Retired kinds are still decoded off legacy transcript rows, and none of
+  // them ever had a line here worth reading.
+  if (!isRuntimeSystemNoteKind(message.kind)) return undefined;
   switch (message.kind) {
-    case 'session_start':
-    case 'session_resume':
-      return undefined;
-    case 'mode_change':
-      return 'Permission mode changed.';
-    case 'model_change':
-      return 'Model changed.';
     case 'context_compacted':
       return 'Context compacted to keep this task within the model window.';
     case 'context_compaction_failed_open':
       return 'Context summary failed; the session continued without a new summary.';
+    case 'context_provider_dropping': {
+      const data = message.data as
+        | { inputTokens?: unknown; priorInputTokens?: unknown }
+        | undefined;
+      const used = typeof data?.inputTokens === 'number' ? data.inputTokens : undefined;
+      const prior = typeof data?.priorInputTokens === 'number' ? data.priorInputTokens : undefined;
+      if (used === undefined || prior === undefined)
+        return "After content was appended, the provider-reported input token count did not grow; context may have been truncated or rewritten. If this persists, check that the model's actual context capacity and the connection settings agree.";
+      return `After content was appended, the provider-reported input token count did not grow; context may have been truncated or rewritten (${used} tokens versus ${prior} before). If this persists, check that the model's actual context capacity and the connection settings agree.`;
+    }
+    case 'context_overflow_after_compaction':
+      return 'History was compacted and the provider still called this request too large. What remains also carries the system prompt, the tool schemas, the summary and the recent tail; shortening this message is the part you control.';
+    case 'context_reported_window_exceeded': {
+      const data = message.data as
+        | { usedTokens?: unknown; reportedContextWindow?: unknown }
+        | undefined;
+      const used = typeof data?.usedTokens === 'number' ? data.usedTokens : undefined;
+      const reported =
+        typeof data?.reportedContextWindow === 'number' ? data.reportedContextWindow : undefined;
+      if (used === undefined || reported === undefined) {
+        return 'This exchange ran past the context window this model reports, and the provider accepted it anyway.';
+      }
+      return `This exchange used about ${used} tokens, past the ${reported} this model reports, and the provider accepted it without complaint. Nothing is declared, so Maka does not compact on its own; declare a context window to have it compact first.`;
+    }
+    case 'context_window_overrun': {
+      const data = message.data as
+        | { usedTokens?: unknown; declaredContextWindow?: unknown }
+        | undefined;
+      const used = typeof data?.usedTokens === 'number' ? data.usedTokens : undefined;
+      const declared =
+        typeof data?.declaredContextWindow === 'number' ? data.declaredContextWindow : undefined;
+      if (used === undefined || declared === undefined) {
+        return 'This exchange ran past the context window declared for this model.';
+      }
+      return `This exchange used about ${used} tokens against the declared window of ${declared}: the reply needed more room than was left. Maka compacts before the next request; raise the window if the replies should stay whole.`;
+    }
+    case 'context_window_suggestion': {
+      const data = message.data as
+        | { suggestedContextWindow?: unknown; declaredContextWindow?: unknown }
+        | undefined;
+      const tokens =
+        typeof data?.suggestedContextWindow === 'number' ? data.suggestedContextWindow : undefined;
+      const declared =
+        typeof data?.declaredContextWindow === 'number' ? data.declaredContextWindow : undefined;
+      if (tokens === undefined) return 'The provider rejected this request as too large.';
+      return declared === undefined
+        ? `The provider rejected this request. No context window is declared for this model; the last accepted request was about ${tokens} tokens — declare that as the window so Maka compacts first.`
+        : `The provider rejected this request at about ${tokens} tokens, below the declared window of ${declared}. The declaration is likely larger than the provider's window; consider lowering it to ${tokens}.`;
+    }
     case 'step_limit':
       return STEP_LIMIT_NOTICE_TEXT;
-    case 'error':
-      return 'Session recorded an error.';
-    case 'abort':
-      return 'Session was stopped.';
   }
 }
 
@@ -1440,6 +1494,10 @@ export function activeUserQuestionRequest(
   return state.pendingInteraction?.type === 'user_question_request'
     ? state.pendingInteraction
     : undefined;
+}
+
+export function activeFormRequest(state: MakaPiTranscriptState): FormRequestEvent | undefined {
+  return state.pendingInteraction?.type === 'form_request' ? state.pendingInteraction : undefined;
 }
 
 function enqueuePendingInteraction(
@@ -2082,8 +2140,15 @@ function findShellRunParent(
 /** The runtime-resource ref a tool call is aimed at, when the args carry one. */
 function readArgsRef(args: unknown): string | undefined {
   const ref =
-    args !== null && typeof args === 'object' ? (args as { ref?: unknown }).ref : undefined;
-  return typeof ref === 'string' && ref.length > 0 ? ref : undefined;
+    args !== null && typeof args === 'object'
+      ? ((args as { path?: unknown }).path ?? (args as { ref?: unknown }).ref)
+      : undefined;
+  if (typeof ref !== 'string' || !ref) return undefined;
+  try {
+    return resolveReadInput({ path: ref }).path;
+  } catch {
+    return undefined;
+  }
 }
 
 /**

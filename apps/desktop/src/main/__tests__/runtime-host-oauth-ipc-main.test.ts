@@ -21,10 +21,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { IpcMainInvokeEvent } from 'electron';
 import { PROVIDER_REGISTRY } from '@maka/core/llm-connections';
+import { RuntimeHostOperationError } from '@maka/runtime-host/client';
 import type {
   RuntimeHostConnectionCatalogEntry as ConnectionCatalogEntry,
   RuntimeHostConnectionCatalogSnapshot as ConnectionCatalogSnapshot,
 } from '@maka/runtime-host/client';
+import type { OAuthLoginProvider } from '@maka/runtime-host/protocol';
 import {
   RUNTIME_HOST_OAUTH_IPC_CHANNELS,
   registerRuntimeHostOAuthIpc,
@@ -156,7 +158,6 @@ test('adapts every Host OAuth provider through one Desktop flow', async () => {
     emitConnectionListChanged: () => {
       changed += 1;
     },
-    isProviderEnabled: () => true,
   });
 
   assert.deepEqual([...handlers.keys()].sort(), [...RUNTIME_HOST_OAUTH_IPC_CHANNELS].sort());
@@ -244,7 +245,6 @@ test('provider-scoped OAuth IPC rejects a Connection ID owned by another provide
     emitConnectionListChanged: () => {
       mutations += 1;
     },
-    isProviderEnabled: () => true,
   });
 
   assert.deepEqual(
@@ -292,7 +292,6 @@ test('malformed OAuth Connection IDs fail closed before catalog or credential ac
     emitConnectionListChanged: () => {
       emissions += 1;
     },
-    isProviderEnabled: () => true,
   });
 
   for (const malformed of [
@@ -425,14 +424,13 @@ test('a second OAuth start cannot replace or cancel a pending active attempt', a
     clientOverrides,
     presentation,
     emitConnectionListChanged: () => undefined,
-    isProviderEnabled: () => true,
   });
 
   const firstAuthorization = invoke(handlers, 'openai-codex:get-auth-url', { kind: 'create' });
   await firstPresentationPoll;
   assert.deepEqual(await invoke(handlers, 'openai-codex:get-auth-url', { kind: 'create' }), {
     ok: false,
-    reason: 'unknown',
+    reason: 'login_in_progress',
     message: 'Another OAuth login is already in progress',
   });
   assert.equal(starts, 1);
@@ -517,7 +515,6 @@ test('completion rejects a terminal projection that changes Connection identity'
     emitConnectionListChanged: () => {
       emitted += 1;
     },
-    isProviderEnabled: () => true,
   });
 
   await invoke(handlers, 'openai-codex:get-auth-url', { kind: 'create' });
@@ -613,7 +610,6 @@ test('keeps a committed OAuth login successful when model discovery fails withou
     emitConnectionListChanged: () => {
       changed += 1;
     },
-    isProviderEnabled: () => true,
   });
 
   assert.deepEqual(await invoke(handlers, 'openai-codex:get-auth-url', { kind: 'create' }), {
@@ -650,6 +646,101 @@ test('keeps a committed OAuth login successful when model discovery fails withou
   assertNoUnexpectedClientCalls();
 });
 
+test('lets the selected Host refuse enrollment instead of prechecking Desktop state', async () => {
+  const { handlers, assertNoUnexpectedClientCalls } = registerOAuthTestHandlers({
+    clientOverrides: {
+      startOAuthLogin: async () => {
+        throw new RuntimeHostOperationError(
+          'oauth.login.start',
+          'operation_unavailable',
+          'OAuth enrollment is disabled for this provider',
+        );
+      },
+    },
+    presentation: new RuntimeHostOAuthPresentation(async () => {
+      throw new Error('A refused enrollment must never open a browser');
+    }),
+    emitConnectionListChanged: () => undefined,
+  });
+
+  assert.deepEqual(
+    await invoke(handlers, 'github-copilot:get-auth-url', { kind: 'create' }),
+    {
+      ok: false,
+      reason: 'experimental_disabled',
+      message: 'OAuth enrollment is disabled for this provider',
+    },
+  );
+  assertNoUnexpectedClientCalls();
+});
+
+test('projects the selected Host answer for whether a provider may enrol', async () => {
+  // The renderer must be able to disable a sign-in the install refuses before
+  // the user clicks it, and the authoritative answer belongs to the selected
+  // Host — a remote Host that enabled Copilot is not bound by this Desktop
+  // process's environment.
+  for (const [enabled, expected] of [[true, true], [false, false]] as const) {
+    const { handlers, assertNoUnexpectedClientCalls } = registerOAuthTestHandlers({
+      clientOverrides: {
+        queryOAuthEnrollment: async (provider: OAuthLoginProvider) => ({ provider, enabled }),
+      },
+      presentation: new RuntimeHostOAuthPresentation(async () => {
+        throw new Error('An enrollment probe must never open a browser');
+      }),
+      emitConnectionListChanged: () => undefined,
+    });
+
+    assert.deepEqual(await invoke(handlers, 'github-copilot:get-enrollment-state'), {
+      enabled: expected,
+    });
+    assertNoUnexpectedClientCalls();
+  }
+});
+
+test('get-auth-url maps only specific Host failures to typed reasons', async () => {
+  const cases = [
+    {
+      label: 'generic Host conflict',
+      thrown: new RuntimeHostOperationError(
+        'oauth.login.start',
+        'operation_conflict',
+        'OAuth Connection capacity is exhausted',
+      ),
+      reason: 'unknown',
+    },
+    {
+      label: 'gated Host',
+      thrown: new RuntimeHostOperationError(
+        'oauth.login.start',
+        'operation_unavailable',
+        'Enrollment is disabled for this install',
+      ),
+      reason: 'experimental_disabled',
+    },
+  ];
+  for (const { label, thrown, reason } of cases) {
+    const { handlers, assertNoUnexpectedClientCalls } = registerOAuthTestHandlers({
+      clientOverrides: {
+        startOAuthLogin: async () => {
+          throw thrown;
+        },
+      },
+      presentation: new RuntimeHostOAuthPresentation(async () => undefined),
+      emitConnectionListChanged: () => undefined,
+    });
+    assert.deepEqual(
+      await invoke(handlers, 'openai-codex:get-auth-url', { kind: 'create' }),
+      {
+        ok: false,
+        reason,
+        message: thrown.message,
+      },
+      label,
+    );
+    assertNoUnexpectedClientCalls();
+  }
+});
+
 function createFailClosedOAuthClient(overrides: Partial<OAuthClient>): {
   readonly client: OAuthClient;
   assertNoUnexpectedClientCalls(): void;
@@ -663,7 +754,6 @@ function createFailClosedOAuthClient(overrides: Partial<OAuthClient>): {
     };
   const client = {
     loadConnectionCatalog: unexpected('loadConnectionCatalog'),
-    createConnection: unexpected('createConnection'),
     updateConnection: unexpected('updateConnection'),
     deleteCredential: unexpected('deleteCredential'),
     fetchConnectionModels: unexpected('fetchConnectionModels'),
@@ -672,6 +762,7 @@ function createFailClosedOAuthClient(overrides: Partial<OAuthClient>): {
     startOAuthLogin: unexpected('startOAuthLogin'),
     queryOAuthLogin: unexpected('queryOAuthLogin'),
     cancelOAuthLogin: unexpected('cancelOAuthLogin'),
+    queryOAuthEnrollment: unexpected('queryOAuthEnrollment'),
     ...overrides,
   } satisfies OAuthClient;
   return {
@@ -684,7 +775,6 @@ function registerOAuthTestHandlers(input: {
   readonly clientOverrides: Partial<OAuthClient>;
   readonly presentation: RuntimeHostOAuthPresentation;
   readonly emitConnectionListChanged: () => void;
-  readonly isProviderEnabled: NonNullable<RuntimeHostOAuthIpcDeps['isProviderEnabled']>;
 }): {
   readonly handlers: ReadonlyMap<string, OAuthIpcHandler>;
   assertNoUnexpectedClientCalls(): void;
@@ -698,7 +788,6 @@ function registerOAuthTestHandlers(input: {
     client,
     presentation: input.presentation,
     emitConnectionListChanged: input.emitConnectionListChanged,
-    isProviderEnabled: input.isProviderEnabled,
   });
   return { handlers, assertNoUnexpectedClientCalls };
 }
@@ -731,3 +820,43 @@ async function invoke(
   if (!handler) throw new Error(`Missing IPC handler: ${channel}`);
   return handler({} as IpcMainInvokeEvent, ...args);
 }
+
+test('get-auth-url carries a browser-open rejection through presentation to the IPC result', async () => {
+  const connectionId = '00000000-0000-4000-8000-000000000016';
+  const presentation = new RuntimeHostOAuthPresentation(async () => {
+    throw new Error('EACCES: xdg-open is not executable');
+  });
+  let startedAttemptId = '';
+  let cancelledAttemptId = '';
+  const { handlers, assertNoUnexpectedClientCalls } = registerOAuthTestHandlers({
+    clientOverrides: {
+      startOAuthLogin: async (attemptId) => {
+        startedAttemptId = attemptId;
+        void presentation
+          .openExternal(
+            'https://example.test/auth',
+            'state-1',
+            new AbortController().signal,
+          )
+          .catch(() => undefined);
+        return oauthProjection(attemptId, connectionId, 'awaiting_authorization');
+      },
+      cancelOAuthLogin: async (attemptId) => {
+        cancelledAttemptId = attemptId;
+        return oauthProjection(attemptId, connectionId, 'cancelled');
+      },
+    },
+    presentation,
+    emitConnectionListChanged: () => undefined,
+  });
+
+  const result = await invoke(handlers, 'openai-codex:get-auth-url', { kind: 'create' });
+
+  assert.deepEqual(result, {
+    ok: false,
+    reason: 'presentation_failed',
+    message: 'Desktop could not open the system browser',
+  });
+  assert.equal(cancelledAttemptId, startedAttemptId);
+  assertNoUnexpectedClientCalls();
+});

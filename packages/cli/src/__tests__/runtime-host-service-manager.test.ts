@@ -497,6 +497,36 @@ describe('managed Runtime Host service', () => {
       },
     );
     assert.equal(parseRuntimeHostCommand(['service', 'status', '--root', '/tmp']).kind, 'error');
+    const setupUpdateArgs = [
+      'setup',
+      '--principal',
+      'desktop.client-1',
+      '--preset',
+      'desktop-client',
+    ];
+    assert.equal(
+      parseRuntimeHostCommand([...setupUpdateArgs, '--allow-interrupt-active-tasks']).kind,
+      'error',
+    );
+    const explicitSetupUpdate = parseRuntimeHostCommand([
+      ...setupUpdateArgs,
+      '--update-existing',
+      '--allow-interrupt-active-tasks',
+    ]);
+    assert.equal(explicitSetupUpdate.kind, 'runtime-host-setup');
+    if (explicitSetupUpdate.kind === 'runtime-host-setup') {
+      assert.equal(explicitSetupUpdate.allowInterruptActiveTasks, true);
+    }
+    assert.equal(
+      parseRuntimeHostCommand([
+        ...setupUpdateArgs,
+        '--update-existing',
+        '--allow-interrupt-active-tasks',
+        '--allow-interrupt-active-tasks',
+      ]).kind,
+      'error',
+    );
+
     assert.equal(
       parseRuntimeHostCommand([
         'setup',
@@ -2549,7 +2579,12 @@ describe('managed Runtime Host service', () => {
       version,
       root: deploymentRoot,
       cliPath,
-      operatorPath: join(deploymentRoot, 'operator'),
+      operator: {
+        kind: 'node' as const,
+        platform: 'posix' as const,
+        nodePath: '/usr/bin/node',
+        modulePath: join(deploymentRoot, 'operator.mjs'),
+      },
       activate: async () => {
         assert.equal(insideLifecycle, true);
         order.push('activate');
@@ -2611,13 +2646,17 @@ describe('managed Runtime Host service', () => {
           ),
         ),
       runOperator: async (
-        _operatorPath: string,
+        operator: import('@maka/runtime-host/operator').RuntimeHostOperatorCommand,
         args: readonly string[],
         invocation?: {
           readonly inheritedFds?: readonly number[];
           readonly capabilityRequest?: RuntimeHostOperatorCapability;
         },
       ) => {
+        assert.deepEqual(operator, {
+          kind: 'legacy_posix_executable',
+          executablePath: join(deploymentRoot, 'operator'),
+        });
         const action = args[0];
         assert.ok(action === 'status' || action === 'retire');
         if (action === 'status') {

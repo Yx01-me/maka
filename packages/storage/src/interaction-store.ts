@@ -31,6 +31,7 @@ import {
   decodeInteractionRequest,
   interactionCanonicalOutcomesEquivalent,
   isInteractionCanonicalOutcomeValidForRequest,
+  projectInteractionFormRequest,
   projectInteractionQuestionRequest,
   type InteractionCanonicalOutcome,
   type InteractionRequest,
@@ -45,8 +46,8 @@ import {
   acquireOperationalStateDatabase,
   type OperationalStateDatabaseLease,
 } from './operational-state-store.js';
+import { isSafeStorageId } from './storage-id.js';
 
-const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const REMEMBER_SCOPE_ID = /^[0-9a-f]{64}$/;
 export const STORED_INTERACTION_REQUEST_MAX_BYTES = 20 * 1024;
 export const STORED_INTERACTION_OUTCOME_MAX_BYTES = 12 * 1024;
@@ -681,6 +682,17 @@ function normalizeRequest(value: unknown, source: DecodeSource): StoredInteracti
       if (!isDeepStrictEqual(request, canonical))
         decodeFailure(source, 'Interaction question request is not canonical safe text');
       request = canonical;
+    } else if (request.kind === 'form') {
+      const canonical = projectInteractionFormRequest({
+        toolUseId: request.toolUseId,
+        message: request.message,
+        requester: request.requester,
+        fields: request.fields,
+      });
+      if (!isDeepStrictEqual(request, canonical)) {
+        decodeFailure(source, 'Interaction form request is not canonical');
+      }
+      request = canonical;
     }
   } catch (error) {
     if (error instanceof InteractionStoreError) throw error;
@@ -776,7 +788,7 @@ function assertId(
   source: DecodeSource = 'input',
   message = 'Invalid Interaction identity',
 ): string {
-  if (typeof value !== 'string' || !SAFE_ID.test(value)) decodeFailure(source, message);
+  if (!isSafeStorageId(value)) decodeFailure(source, message);
   return value;
 }
 

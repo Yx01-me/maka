@@ -18,13 +18,13 @@
  */
 
 import type {
+  MessageQueuePlacement,
   QuoteRef,
   SessionEvent,
   ShellRunUpdate,
 } from '@maka/core/events';
 import type {
   ArtifactBinaryReadResult,
-  ArtifactChangedEvent,
   ArtifactDescriptor,
   ArtifactSaveResult,
   ArtifactTextReadResult,
@@ -35,6 +35,7 @@ import type { PermissionMode } from '@maka/core/permission';
 import type { RegenerateTurnInput } from '@maka/core/runtime-inputs';
 import type { SandboxBoundaryResponse } from '@maka/core/sandbox-boundary';
 import type { ClientCapabilityResponse } from '@maka/core/client-capability-grant';
+import type { WorkBoardItem, WorkBoardLinkedSession } from '@maka/core/work-board';
 import type {
   SessionChangedEvent,
   SessionSummary,
@@ -42,10 +43,14 @@ import type {
   TurnRecord,
 } from '@maka/core/session';
 import type { SessionTrace } from '@maka/core/session-trace';
-import type { SessionTodoItem } from '@maka/core/session-todo';
 import type { UserQuestionResponse } from '@maka/core/user-question';
+import type { InteractionFormResponse } from '@maka/core/interaction';
 import type { Result } from '@maka/core/result';
-import type { ContextDiagnosticsResult } from '@maka/runtime-host/protocol';
+import type {
+  ContextCompactResult,
+  ContextDiagnosticsResult,
+  TurnMessageExecutionQueryResult,
+} from '@maka/runtime-host/protocol';
 import type { MergedUsageSummary } from '@maka/core/usage-ledger-merge';
 import type {
   ShellRunPtyDataEvent,
@@ -71,8 +76,12 @@ export interface WorkbarReviewService {
 }
 
 export interface WorkbarTerminalService {
+  /** Live, locally owned manual terminals; excludes model tools and inherited resources. */
+  recover(sessionId: string): Promise<import('../../../shared/runtime-host-identity.js').TerminalRecovery>;
+  subscribeCloseChanges(handler: (change: import('../../../shared/runtime-host-identity.js').TerminalCloseChange) => void): WorkbarUnsubscribe;
+  subscribeUpdates(handler: (update: ShellRunUpdate) => void): WorkbarUnsubscribe;
   start(sessionId: string): Promise<ShellRunUpdate>;
-  stop(input: { sessionId: string; ref: string }): Promise<ShellRunUpdate | null>;
+  stop(input: { sessionId: string; ref: string }): Promise<void>;
   attach(input: {
     sessionId: string;
     ref: string;
@@ -83,19 +92,12 @@ export interface WorkbarTerminalService {
     ref: string;
     input?: string;
     size?: { cols: number; rows: number };
-  }): Promise<ShellRunUpdate | null>;
+  }): Promise<void>;
   subscribePtyData(
     handler: (event: ShellRunPtyDataEvent) => void,
   ): WorkbarUnsubscribe;
   subscribeResync(
     handler: (event: { sessionId: string }) => void,
-  ): WorkbarUnsubscribe;
-}
-
-export interface WorkbarTodoService {
-  read(sessionId: string): Promise<SessionTodoItem[]>;
-  subscribeChanges(
-    handler: (event: { sessionId: string; at: number }) => void,
   ): WorkbarUnsubscribe;
 }
 
@@ -112,9 +114,6 @@ export interface WorkbarBrowserService {
   subscribeState(
     handler: (payload: { sessionId: string; state: BrowserState }) => void,
   ): WorkbarUnsubscribe;
-  subscribeLive(
-    handler: (payload: { sessionIds: string[] }) => void,
-  ): WorkbarUnsubscribe;
 }
 
 export type WorkbarOpenArtifactResult =
@@ -130,10 +129,7 @@ export type WorkbarOpenArtifactResult =
     };
 
 export interface WorkbarArtifactsService {
-  list(
-    sessionId: string,
-    options?: { includeDeleted?: boolean },
-  ): Promise<ArtifactDescriptor[]>;
+  list(sessionId: string): Promise<ArtifactDescriptor[]>;
   readText(
     sessionId: string,
     artifactId: string,
@@ -143,10 +139,11 @@ export interface WorkbarArtifactsService {
     artifactId: string,
   ): Promise<ArtifactBinaryReadResult>;
   delete(sessionId: string, artifactId: string): Promise<void>;
-  subscribeChanges(
-    handler: (event: ArtifactChangedEvent) => void,
-  ): WorkbarUnsubscribe;
   openPath(
+    sessionId: string,
+    artifactId: string,
+  ): Promise<WorkbarOpenArtifactResult>;
+  showInFolder(
     sessionId: string,
     artifactId: string,
   ): Promise<WorkbarOpenArtifactResult>;
@@ -197,15 +194,25 @@ export interface WorkbarAttachmentsService {
   >;
 }
 
+export interface WorkbarWorkBoardService {
+  linkSession(
+    id: string,
+    link: WorkBoardLinkedSession,
+  ): Promise<
+    | { readonly ok: true; readonly value: WorkBoardItem }
+    | { readonly ok: false; readonly message: string }
+  >;
+}
+
 export type SideChatSendResult =
   | { ok: true; turnId: string; steered?: false }
   | { ok: true; turnId: string; steered: true; messageId: string }
   | { ok: false; reason: 'outcome_unknown'; messageId: string }
   | { ok: false; reason?: string; messageId?: never };
 
-export type SideChatSteerResult =
-  | { kind: 'queued'; messageId: string }
-  | { kind: 'outcome_unknown'; messageId: string }
+export type SideChatFollowUpResult =
+  | { kind: 'queued' }
+  | { kind: 'outcome_unknown' }
   | { kind: 'started'; turnId: string };
 
 export type SideChatStopTarget =
@@ -217,12 +224,12 @@ export interface SideChatSessionPort {
   listTurns(sessionId: string): Promise<TurnRecord[]>;
   readSettledMessages(
     sessionId: string,
-    options?: { requiredAssistantMessageId?: string },
+    options?: { requiredAssistantMessageId?: string; requiredTurnId?: string },
   ): Promise<{ messages: StoredMessage[]; settled: boolean }>;
   branchFromTurn(
     sessionId: string,
     input: {
-      sourceTurnId: string;
+      sourceTurnId?: string;
       name?: string;
       copyId: string;
       sideConversation: true;
@@ -233,6 +240,7 @@ export interface SideChatSessionPort {
   >;
   cleanupSessionCopy(sessionId: string): Promise<void>;
   abandonSessionCopy(sourceSessionId: string, copyId: string): Promise<void>;
+  compact(sessionId: string): Promise<ContextCompactResult>;
   send(
     sessionId: string,
     command: {
@@ -247,7 +255,26 @@ export interface SideChatSessionPort {
     sessionId: string,
     target?: SideChatStopTarget,
   ): Promise<{ kind: 'retracted'; messageId: string } | undefined>;
-  steer(sessionId: string, text: string, admissionId?: string): Promise<SideChatSteerResult>;
+  submitFollowUp(
+    sessionId: string,
+    placement: MessageQueuePlacement,
+    text: string,
+    admissionId: string,
+    content?: { quotes?: QuoteRef[]; attachmentItems?: WorkbarIngestInput[] },
+  ): Promise<SideChatFollowUpResult>;
+  queryMessageExecutions(
+    sessionId: string,
+    messageIds: readonly string[],
+  ): Promise<TurnMessageExecutionQueryResult>;
+  retractQueueEntry(sessionId: string, entryId: string): Promise<void>;
+  promoteQueueEntry(sessionId: string, entryId: string): Promise<void>;
+  updateQueueEntry(
+    sessionId: string,
+    entryId: string,
+    expectedQueueRevision: number,
+    text: string,
+  ): Promise<void>;
+  reorderQueueEntries(sessionId: string, entryIds: readonly string[]): Promise<void>;
   setPermissionMode(
     sessionId: string,
     mode: PermissionMode,
@@ -265,11 +292,17 @@ export interface SideChatSessionPort {
     sessionId: string,
     response: UserQuestionResponse,
   ): Promise<void>;
+  respondToUserForm(
+    sessionId: string,
+    response: InteractionFormResponse,
+  ): Promise<void>;
   subscribeEvents(
     sessionId: string,
     handler: (event: SessionEvent) => void,
-    onSeeded?: () => void,
+    /** Called after the initial observation seed and each reconnect seed. */
+    onReady?: () => void,
     onSeedError?: (error: unknown) => void,
+    onExecution?: (projection: import('../../../shared/session-execution-projection.js').SessionExecutionProjection | undefined) => void,
   ): WorkbarUnsubscribe;
   subscribeSessionChanges(handler: (event: SessionChangedEvent) => void): WorkbarUnsubscribe;
 }
@@ -277,10 +310,10 @@ export interface SideChatSessionPort {
 export interface WorkbarServices {
   readonly review: WorkbarReviewService;
   readonly terminal: WorkbarTerminalService;
-  readonly todo: WorkbarTodoService;
   readonly browser: WorkbarBrowserService;
   readonly artifacts: WorkbarArtifactsService;
   readonly inspector: WorkbarInspectorService;
   readonly attachments: WorkbarAttachmentsService;
+  readonly workBoard?: WorkbarWorkBoardService;
   readonly sideChat: SideChatSessionPort;
 }

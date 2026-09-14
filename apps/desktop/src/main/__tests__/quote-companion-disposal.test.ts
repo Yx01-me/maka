@@ -20,7 +20,10 @@
 import { deferred } from '@maka/core/test-only/async-primitives';
 import { strict as assert } from 'node:assert';
 import { afterEach, describe, it } from 'node:test';
-import type { SessionSummary, TurnRecord } from '@maka/core/session';
+import type {
+  SessionSummary,
+  TurnRecord,
+} from '@maka/core/session';
 import {
   abandonPendingCompanionCopy,
   createFakeWorkbarServices,
@@ -47,7 +50,7 @@ function session(id: string): SessionSummary {
 }
 
 function settledTurn(turnId: string): TurnRecord {
-  return { turnId, status: 'completed', partialOutputRetained: false };
+  return { turnId, status: 'completed' };
 }
 
 const sourceSession = session('side-chat-disposal-source');

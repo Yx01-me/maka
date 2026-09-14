@@ -81,11 +81,20 @@ import {
 } from './session-subscription.js';
 import { ClientCapabilityChannel } from './client-capability-channel.js';
 import type { ClientCapabilityProvider } from './client-capability.js';
+import {
+  readRuntimeHostProcessIdentity,
+  type RuntimeHostProcessIdentity,
+} from './process-identity.js';
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 500;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 2_000;
 const DEFAULT_LIVENESS_INTERVAL_MS = 2_000;
-const DEFAULT_LIVENESS_TIMEOUT_MS = 2_000;
+// A bounded round trip tolerates short transport/Host stalls. Unrelated inbound
+// traffic must never extend it: receiving events does not prove requests work.
+const DEFAULT_LIVENESS_TIMEOUT_MS = 8_000;
+// Peer byte-stream recovery owns a bounded 30-second reattachment budget.
+// Its independent path probes detect failures; Host probes still bound a hung Host.
+const PEER_LIVENESS_TIMEOUT_MS = 45_000;
 const MAX_WEBSOCKET_FRAGMENTS = 256;
 const MAX_WEBSOCKET_BUFFERED_CHUNKS = 256;
 
@@ -99,12 +108,9 @@ export interface ConnectRuntimeHostInput {
   connectTimeoutMs?: number;
   handshakeTimeoutMs?: number;
   /**
-   * Maximum quiet interval before an end-to-end Host liveness probe.
-   * Any valid inbound frame restarts the quiet interval. A Host status
-   * observer additionally uses this as its periodic observation cadence;
-   * inbound traffic then extends an outstanding probe's progress deadline
-   * without suppressing future status observations. Injectable so tests can
-   * exercise the cadence without waiting the real default (2s).
+   * Interval between end-to-end Host liveness probes. Probes continue while
+   * inbound traffic is active; only a matching response proves a round trip.
+   * Injectable so tests can exercise the cadence without waiting 2 seconds.
    */
   livenessIntervalMs?: number;
   /**
@@ -138,18 +144,21 @@ export type ConnectRuntimeHostResult =
       kind: 'incompatible';
       handshake: HostIncompatible;
       registration: HostRegistration;
+      processIdentity?: RuntimeHostProcessIdentity;
     }
   | {
       kind: 'upgrade_required';
       registration: HostRegistration;
       restartable: true;
       handshake: HostIncompatible;
+      processIdentity?: RuntimeHostProcessIdentity;
     }
   | {
       kind: 'upgrade_required';
       registration: HostRegistration;
       restartable: false;
       handshake?: HostIncompatible;
+      processIdentity?: RuntimeHostProcessIdentity;
     }
   | { kind: 'draining'; registration: HostRegistration }
   | {
@@ -186,6 +195,7 @@ export interface ConnectRuntimeHostMessageTransportInput {
   readonly onHostStatus?: (status: HostStatusResult) => void;
   readonly connectionResource?: RuntimeHostConnectionResource;
   readonly peerPath?: RuntimeHostPeerConnectionPath;
+  readonly getPeerPath?: () => RuntimeHostPeerConnectionPath | undefined;
 }
 
 export interface RuntimeHostConnectionResource {
@@ -234,9 +244,11 @@ interface ConnectResolvedRuntimeHostInput
   clientInstanceId: string;
   controlDirectory: string;
   electionDeadline?: number;
+  readProcessIdentity?: typeof readRuntimeHostProcessIdentity;
 }
 
 export interface RuntimeHostConnection {
+  readonly cooperativeHandoff?: true;
   readonly rootId: string;
   readonly hostEpoch: string;
   readonly connectionId: string;
@@ -336,14 +348,25 @@ interface QueuedDomainFrame {
 
 type RequestTimeoutScope = 'request' | 'connection';
 
+// A Host response can reach the Client before the Host's transport write
+// promise resumes and retires that request. Leave one slot free so replacing
+// the observed response cannot transiently cross the Host's hard limit. The
+// Host serializes outbound writes, so at most one response occupies this
+// acknowledgement window.
+const CLIENT_MAX_IN_FLIGHT_DOMAIN_REQUESTS = RUNTIME_HOST_MAX_IN_FLIGHT_DOMAIN_REQUESTS - 1;
+
 class RuntimeHostConnectionImpl implements RuntimeHostConnection {
+  readonly cooperativeHandoff?: true;
   readonly rootId: string;
   readonly hostEpoch: string;
   readonly connectionId: string;
   readonly selectedProtocol: number;
   readonly compositionId: string;
   readonly compositionRevision: string;
-  readonly peerPath: RuntimeHostPeerConnectionPath | undefined;
+  readonly #getPeerPath: () => RuntimeHostPeerConnectionPath | undefined;
+  get peerPath(): RuntimeHostPeerConnectionPath | undefined {
+    return this.#getPeerPath();
+  }
   readonly closed: Promise<void>;
   readonly #transport: RuntimeHostMessageTransport;
   readonly #pendingRequests = new Map<string, PendingRequest>();
@@ -375,6 +398,7 @@ class RuntimeHostConnectionImpl implements RuntimeHostConnection {
       selectedProtocol: number;
       compositionId: string;
       compositionRevision: string;
+      cooperativeHandoff?: true;
     },
     // livenessIntervalMs is validated by connectResolvedRuntimeHost alongside
     // the other connect timeouts, before any transport work happens.
@@ -384,6 +408,7 @@ class RuntimeHostConnectionImpl implements RuntimeHostConnection {
       onHostStatus?: (status: HostStatusResult) => void;
       connectionResource?: RuntimeHostConnectionResource;
       peerPath?: RuntimeHostPeerConnectionPath;
+      getPeerPath?: () => RuntimeHostPeerConnectionPath | undefined;
     },
   ) {
     this.#livenessIntervalMs = options?.livenessIntervalMs ?? DEFAULT_LIVENESS_INTERVAL_MS;
@@ -394,9 +419,10 @@ class RuntimeHostConnectionImpl implements RuntimeHostConnection {
     this.hostEpoch = accepted.hostEpoch;
     this.connectionId = accepted.connectionId;
     this.selectedProtocol = accepted.selectedProtocol;
+    this.cooperativeHandoff = accepted.cooperativeHandoff;
     this.compositionId = accepted.compositionId;
     this.compositionRevision = accepted.compositionRevision;
-    this.peerPath = options?.peerPath;
+    this.#getPeerPath = options?.getPeerPath ?? (() => options?.peerPath);
     const connectionResource = options?.connectionResource;
     if (connectionResource) {
       const abortForResourceClosure = (cause: Error) =>
@@ -528,7 +554,7 @@ class RuntimeHostConnectionImpl implements RuntimeHostConnection {
   #drainDomainRequests(): void {
     while (
       !this.#terminalError &&
-      this.#inFlightDomainRequests < RUNTIME_HOST_MAX_IN_FLIGHT_DOMAIN_REQUESTS
+      this.#inFlightDomainRequests < CLIENT_MAX_IN_FLIGHT_DOMAIN_REQUESTS
     ) {
       const queued = this.#queuedDomainFrames.shift();
       if (!queued) return;
@@ -546,7 +572,7 @@ class RuntimeHostConnectionImpl implements RuntimeHostConnection {
     return this.#requestOperation(
       'host.status',
       {},
-      timeoutMs ?? DEFAULT_LIVENESS_TIMEOUT_MS,
+      timeoutMs ?? (this.peerPath ? PEER_LIVENESS_TIMEOUT_MS : DEFAULT_LIVENESS_TIMEOUT_MS),
       (status) => this.#validateHostStatusIdentity(status),
       'connection',
     );
@@ -570,15 +596,45 @@ class RuntimeHostConnectionImpl implements RuntimeHostConnection {
     return status;
   }
 
-  openSessionSubscription(
+  async openSessionSubscription(
     input: SubscriptionOpenInput,
     timeoutMs?: number,
+  ): Promise<RuntimeHostSessionSubscription> {
+    const deadline =
+      Date.now() + (timeoutMs === undefined ? 30_000 : requireTimeout(timeoutMs, 'timeoutMs'));
+    for (;;) {
+      try {
+        return await this.#openSessionSubscription(
+          input,
+          Math.max(1, deadline - Date.now()),
+          timeoutMs,
+        );
+      } catch (error) {
+        if (
+          !(error instanceof RuntimeHostOperationError) ||
+          error.code !== 'transcript_preparing' ||
+          input.transcript.kind !== 'tail' ||
+          this.#terminalError ||
+          Date.now() >= deadline
+        )
+          throw error;
+        // Each refusal committed a bounded, resumable index batch. Keep the
+        // caller in its loading state and yield before requesting more work.
+        await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      }
+    }
+  }
+
+  #openSessionSubscription(
+    input: SubscriptionOpenInput,
+    openTimeoutMs: number,
+    requestTimeoutMs?: number,
   ): Promise<RuntimeHostSessionSubscription> {
     const expectedSessionId = input.sessionId;
     return this.#requestOperation(
       'subscription.open',
       input,
-      timeoutMs,
+      openTimeoutMs,
       (result) => {
         if (result.hostEpoch !== this.hostEpoch) {
           throw new RuntimeHostSubscriptionError(
@@ -601,13 +657,13 @@ class RuntimeHostConnectionImpl implements RuntimeHostConnection {
         const subscription = new ClientSessionSubscription(
           result,
           () => this.#closeSessionSubscription(result.subscriptionId),
-          (query) => this.request('session.transcript.page', query, timeoutMs),
+          (query) => this.request('session.transcript.page', query, requestTimeoutMs),
           async () => {
             try {
               await this.request(
                 'session.transcript.overlay.release',
                 { subscriptionId: result.subscriptionId },
-                timeoutMs,
+                requestTimeoutMs,
               );
             } catch (error) {
               this.#fail(asError(error));
@@ -623,8 +679,18 @@ class RuntimeHostConnectionImpl implements RuntimeHostConnection {
   }
 
   async close(): Promise<void> {
-    this.#clientCapabilities.close(new Error('Runtime Host connection closed by Client'));
-    this.#transport.abort();
+    if (!this.peerPath) {
+      this.#clientCapabilities.close(new Error('Runtime Host connection closed by Client'));
+      this.#transport.abort();
+      await this.closed;
+      return;
+    }
+    // An intentional peer close must send logical FIN. Aborting its raw path
+    // instead leaves the Host retaining a recoverable session and its quota.
+    this.#fail(
+      new RuntimeHostTransportError('closed', 'Runtime Host connection closed by Client'),
+      true,
+    );
     await this.closed;
   }
 
@@ -672,7 +738,7 @@ class RuntimeHostConnectionImpl implements RuntimeHostConnection {
     try {
       while (true) {
         const frame = decodeHostFrame(await this.#transport.read(0));
-        this.#resetLivenessCheck();
+        this.#scheduleLivenessCheck();
         if ('kind' in frame) {
           if (isClientCapabilityHostFrameKind(frame.kind)) {
             this.#clientCapabilities.accept(frame as ClientCapabilityHostFrame);
@@ -827,19 +893,8 @@ class RuntimeHostConnectionImpl implements RuntimeHostConnection {
     this.#drainDomainRequests();
   }
 
-  #resetLivenessCheck(): void {
-    // Any authenticated Host frame proves the transport is still making
-    // progress, even when a periodic status observation is slow.
-    this.#resetLivenessProbeDeadline();
-    // A status observer needs periodic route observations even while other
-    // Session traffic keeps the connection active.
-    if (this.#onHostStatus) return;
-    if (this.#livenessTimer) clearTimeout(this.#livenessTimer);
-    this.#livenessTimer = undefined;
-    this.#scheduleLivenessCheck();
-  }
-
   #scheduleLivenessCheck(): void {
+    // Inbound events do not postpone the next bidirectional probe.
     if (this.#terminalError || this.#livenessTimer || this.#livenessProbePending) {
       return;
     }
@@ -852,7 +907,13 @@ class RuntimeHostConnectionImpl implements RuntimeHostConnection {
   #startLivenessProbe(): void {
     if (this.#terminalError || this.#livenessProbePending) return;
     this.#livenessProbePending = true;
-    this.#resetLivenessProbeDeadline();
+    this.#livenessProbeDeadline = setTimeout(
+      () => {
+        this.#livenessProbeDeadline = undefined;
+        this.#fail(requestTimeoutError('host.status'));
+      },
+      this.peerPath ? PEER_LIVENESS_TIMEOUT_MS : DEFAULT_LIVENESS_TIMEOUT_MS,
+    );
     void this.#requestOperation(
       'host.status',
       {},
@@ -875,15 +936,6 @@ class RuntimeHostConnectionImpl implements RuntimeHostConnection {
         this.#livenessProbePending = false;
         this.#scheduleLivenessCheck();
       });
-  }
-
-  #resetLivenessProbeDeadline(): void {
-    if (!this.#livenessProbePending || this.#terminalError) return;
-    if (this.#livenessProbeDeadline) clearTimeout(this.#livenessProbeDeadline);
-    this.#livenessProbeDeadline = setTimeout(() => {
-      this.#livenessProbeDeadline = undefined;
-      this.#fail(requestTimeoutError('host.status'));
-    }, DEFAULT_LIVENESS_TIMEOUT_MS);
   }
 
   #acceptSubscriptionFrame(frame: SubscriptionFrame): void {
@@ -945,7 +997,7 @@ class RuntimeHostConnectionImpl implements RuntimeHostConnection {
     ).catch((failure: unknown) => this.#fail(asError(failure)));
   }
 
-  #fail(error: Error): void {
+  #fail(error: Error, gracefulPeerClose = false): void {
     if (this.#terminalError) return;
     this.#terminalError = error;
     if (this.#livenessTimer) clearTimeout(this.#livenessTimer);
@@ -982,7 +1034,8 @@ class RuntimeHostConnectionImpl implements RuntimeHostConnection {
     this.#configurationChangeListeners.clear();
     this.#sessionCatalogChangeListeners.clear();
     this.#scheduledTaskChangeListeners.clear();
-    this.#transport.abort();
+    if (gracefulPeerClose) this.#transport.closeAfterFlush();
+    else this.#transport.abort();
   }
 }
 
@@ -1092,6 +1145,7 @@ export async function connectRuntimeHostMessageTransport(
       onHostStatus: input.onHostStatus,
       connectionResource: input.connectionResource,
       ...(input.peerPath ? { peerPath: input.peerPath } : {}),
+      ...(input.getPeerPath ? { getPeerPath: input.getPeerPath } : {}),
     });
     if (result.kind === 'connected') {
       resourceTransferred = true;
@@ -1223,6 +1277,16 @@ export async function connectResolvedRuntimeHost(
       registration,
     };
   }
+  // Observe the candidate before opening its endpoint. Besides keeping this
+  // potentially slow OS query outside the Host's handshake window, the later
+  // root/epoch-validated handshake binds this evidence to the registration we
+  // actually reached. Query failure deliberately leaves recovery unavailable.
+  const processIdentity = shouldObserveProcessIdentity(registration, generation, input.protocol)
+    ? await (input.readProcessIdentity ?? readRuntimeHostProcessIdentity)(registration.pid).catch(
+        () => undefined,
+      )
+    : undefined;
+  const processEvidence = processIdentity === undefined ? {} : { processIdentity };
   const connectDeadline = phaseDeadline(connectTimeoutMs, input.electionDeadline);
   const connectBudget = remainingTimeout(connectDeadline.at);
   if (connectBudget === undefined) {
@@ -1310,7 +1374,12 @@ export async function connectResolvedRuntimeHost(
         registration.generation !== generation
       ) {
         await result.connection.close().catch(() => undefined);
-        return { kind: 'upgrade_required', registration, restartable: false };
+        return {
+          kind: 'upgrade_required',
+          registration,
+          restartable: false,
+          ...processEvidence,
+        };
       }
       return { ...result, registration };
     }
@@ -1331,16 +1400,18 @@ export async function connectResolvedRuntimeHost(
             registration,
             restartable: true,
             handshake: result.handshake,
+            ...processEvidence,
           }
         : {
             kind: 'upgrade_required',
             registration,
             restartable: false,
             handshake: result.handshake,
+            ...processEvidence,
           };
     }
     return result.kind === 'incompatible'
-      ? { ...result, registration }
+      ? { ...result, registration, ...processEvidence }
       : { kind: 'draining', registration };
   } catch (error) {
     transport.abort();
@@ -1383,6 +1454,20 @@ export async function connectResolvedRuntimeHost(
   }
 }
 
+function shouldObserveProcessIdentity(
+  registration: HostRegistration,
+  generation: string | undefined,
+  protocol: ProtocolRange,
+): boolean {
+  return (
+    registration.lifecycleMode === 'ephemeral' &&
+    (registration.compatibilityEpoch !== RUNTIME_HOST_COMPATIBILITY_EPOCH ||
+      registration.protocolMax < protocol.min ||
+      registration.protocolMin > protocol.max ||
+      (generation !== undefined && registration.generation !== generation))
+  );
+}
+
 interface ExchangeRuntimeHostHandshakeInput {
   readonly transport: RuntimeHostMessageTransport;
   readonly protocol: ProtocolRange;
@@ -1400,6 +1485,7 @@ interface ExchangeRuntimeHostHandshakeInput {
   readonly onHostStatus?: (status: HostStatusResult) => void;
   readonly connectionResource?: RuntimeHostConnectionResource;
   readonly peerPath?: RuntimeHostPeerConnectionPath;
+  readonly getPeerPath?: () => RuntimeHostPeerConnectionPath | undefined;
 }
 
 interface LegacySurfaceClientHello extends ClientHello {
@@ -1423,6 +1509,7 @@ async function exchangeRuntimeHostHandshake(
   const helloProtocol = input.helloProtocol ?? input.protocol;
   const hello: LegacySurfaceClientHello = {
     kind: 'hello',
+    activitySnapshotVersion: 2,
     clientInstanceId: input.clientInstanceId,
     surface: 'desktop',
     protocolMin: helloProtocol.min,
@@ -1481,6 +1568,7 @@ async function exchangeRuntimeHostHandshake(
       onHostStatus: input.onHostStatus,
       connectionResource: input.connectionResource,
       ...(input.peerPath ? { peerPath: input.peerPath } : {}),
+      ...(input.getPeerPath ? { getPeerPath: input.getPeerPath } : {}),
     }),
   };
 }

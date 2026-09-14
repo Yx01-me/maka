@@ -20,15 +20,15 @@
 import { useEffect, useEffectEvent, useLayoutEffect } from 'react';
 import { useHotkeys } from '@astryxdesign/core/hooks';
 import type { ConnectionEvent } from '@maka/core/connections';
-import type { SessionChangedEvent, SessionSummary, StoredMessage } from '@maka/core/session';
+import type { SessionChangedEvent, SessionSummary } from '@maka/core/session';
 import type { SessionEvent } from '@maka/core/events';
 import type { SessionEventStreamSnapshot } from '@maka/core/session-event-health';
 import type { ThemePalette, ThemePreference } from '@maka/core/settings';
 import type { UiLocale } from '@maka/core/ui-locale';
-import { generalizedErrorMessageChinese } from '@maka/core/redaction';
 import { sessionExpectsEventStream } from '@maka/core/session-event-health';
 import { type ShellRunUpdate } from '@maka/core/events';
 import type { LiveTurnProjection, NavSelection } from '@maka/ui';
+import type { TranscriptPublisher } from './features/conversation/index.js';
 import { messageReadErrorMessage } from './app-shell-copy';
 import { getDesktopConversationCopy } from './locales/conversation-copy.js';
 import { applyTheme, applyThemePalette } from './theme';
@@ -51,12 +51,7 @@ import {
   ShellRunHydration,
   type ShellRunUpdatesBySession,
 } from './shell-run-update-state.js';
-import { runtimeHostChangeRetiresSession } from '../shared/runtime-host-identity.js';
-import {
-  createDesktopTranscriptRangeController,
-  DesktopTranscriptRangeStore,
-  type DesktopTranscriptRangeController,
-} from './desktop-transcript-range-store.js';
+import * as desktopTranscript from './platform/desktop/desktop-transcript-range-store.js';
 
 type RefBox<T> = { current: T };
 
@@ -153,8 +148,6 @@ export function useAppShellBootstrapSubscriptions(options: {
   bootstrapSessions: () => Promise<void>;
   clearPendingTurnActionsForSession: (sessionId: string) => void;
   /** Releases a send's pending claim once the authority names that turn. */
-  confirmLiveTurn: (sessionId: string, turnId: string) => void;
-  clearSessionRendererState: (sessionId: string) => void;
   createSession: () => Promise<void> | void;
   handleConnectionEvent: (event: ConnectionEvent) => void;
   openHelp: () => void;
@@ -169,13 +162,13 @@ export function useAppShellBootstrapSubscriptions(options: {
   refreshShellSettings: () => Promise<void>;
   refreshSessions: () => Promise<SessionSummary[]>;
   rendererMountedRef: RefBox<boolean>;
-  setActiveId: (sessionId: string | undefined) => void;
-  setMessages: (messages: StoredMessage[]) => void;
+  retireSession: (sessionId: string) => void;
+  retiredSessionIds(sessions: readonly { id: string }[]): string[];
   setSessionEventHealthBySession: SessionEventHealthUpdater;
   toastApi: ToastApi;
 }) {
   const runDeferredStartupRefreshes = useEffectEvent(() => {
-    void options.refreshSessions();
+    void options.bootstrapSessions();
     void options.applyE2eFixture();
   });
   const handleConnectionSubscriptionEvent = useEffectEvent((event: ConnectionEvent) => {
@@ -183,11 +176,7 @@ export function useAppShellBootstrapSubscriptions(options: {
   });
   const handleRuntimeHostChange = useEffectEvent((event: DesktopRuntimeHostProfileChangedEvent) => {
     void options.refreshSessions().then((sessions) => {
-      const activeSessionId = options.activeIdRef.current;
-      if (!runtimeHostChangeRetiresSession(event, activeSessionId, sessions)) return;
-      options.setActiveId(undefined);
-      options.setMessages([]);
-      options.clearSessionRendererState(activeSessionId);
+      options.retiredSessionIds(sessions).forEach(options.retireSession);
     });
     if (event.readiness !== 'ready') return;
     if (!event.isDefault) return;
@@ -209,13 +198,8 @@ export function useAppShellBootstrapSubscriptions(options: {
   });
   const handleSessionChange = useEffectEvent(
     (event: SessionChangedEvent) => {
-      // The authority has spoken about a specific turn — whether it started,
-      // failed to start, or ended. That confirms the send's arm, and the
-      // session's status becomes readable as an answer about it again.
-      if (event.sessionId && event.turnId) {
-        options.confirmLiveTurn(event.sessionId, event.turnId);
-      }
-      void options.refreshSessions();
+      const refreshedSessions = options.refreshSessions();
+      if (event.reason === 'archived' && event.sessionId) options.retireSession(event.sessionId);
       if (event.reason === 'created' || event.reason === 'migrated') {
         void options.refreshProjects();
       }
@@ -243,12 +227,9 @@ export function useAppShellBootstrapSubscriptions(options: {
       const copy = getDesktopConversationCopy(options.uiLocale).actions;
       options.toastApi.info(copy.modelReboundTitle, copy.modelReboundDescription(event.modelId));
     }
-    if (event.reason === 'deleted' && event.sessionId && event.sessionId === options.activeIdRef.current) {
-      const deletedSessionId = event.sessionId;
-      options.setActiveId(undefined);
-      options.setMessages([]);
-      options.clearSessionRendererState(deletedSessionId);
-    }
+    void refreshedSessions.then((sessions) => {
+      options.retiredSessionIds(sessions).forEach(options.retireSession);
+    });
     },
   );
   // Both shortcuts fire while the composer has focus — they always did, and
@@ -328,32 +309,40 @@ export function useAppShellBootstrapSubscriptions(options: {
 export function useActiveSessionEvents(options: {
   uiLocale: UiLocale;
   activeId: string | undefined;
-  activeProfileId: string | undefined;
+  observationAuthorityRevision: number;
   activeIdRef: RefBox<string | undefined>;
   handleEvent: (sessionId: string, event: SessionEvent) => void;
-  beginObservationSeed?: (sessionId: string) => number;
-  completeObservationSeed?: (sessionId: string, generation?: number) => void;
+  setExecution: import('./features/conversation/index.js').AppShellSessionUiStateController['setExecution'];
+  beginObservationSeed: (sessionId: string) => void;
+  completeObservationSeed: (sessionId: string) => void;
   setMessageLoadErrorBySession: (updater: (current: Record<string, string>) => Record<string, string>) => void;
+  clearMessageLoadError(sessionId: string): void;
   setMessageLoadPending: (pending: boolean) => void;
-  setMessages: (messages: StoredMessage[]) => void;
-  transcriptRangeRef: RefBox<DesktopTranscriptRangeController | undefined>;
+  commitTranscript: import('./session-workspace-actions.js').SessionWorkspaceActions['commitTranscript'];
+  publishTranscript: TranscriptPublisher<
+    desktopTranscript.DesktopTranscriptRangeController
+  >;
+  transcriptRangeRef: RefBox<desktopTranscript.DesktopTranscriptRangeController | undefined>;
   setSessionEventHealthBySession: SessionEventHealthUpdater;
   toastApi: Pick<ToastApi, 'error'>;
 }) {
   const activeId = options.activeId;
+  const clearMessageLoadError = useEffectEvent(options.clearMessageLoadError);
+  // Publication rechecks both the requested Session and the effect instance
+  // after any reader input wait before handing over the displayed transcript.
   const applyTranscript = useEffectEvent((
     sessionId: string,
-    store: DesktopTranscriptRangeStore,
-    isDisposed: () => boolean,
+    controller: desktopTranscript.DesktopTranscriptRangeController,
+    effectIsCurrent: () => boolean,
   ) => {
-    if (!isDisposed() && options.activeIdRef.current === sessionId) {
-      const snapshot = store.snapshot();
-      options.setMessages([...snapshot.messages]);
-      if (snapshot.ready) options.setMessageLoadPending(false);
-    }
+    options.publishTranscript(sessionId, controller, effectIsCurrent, () => {
+      clearMessageLoadError(sessionId);
+      options.setMessageLoadPending(false);
+    });
   });
-  const applyReadError = useEffectEvent((sessionId: string, error: unknown, isDisposed: () => boolean) => {
-    if (!isDisposed() && options.activeIdRef.current === sessionId) {
+  const applyReadError = useEffectEvent((sessionId: string, error: unknown) => {
+    if (options.activeId === sessionId) {
+      if (options.activeIdRef.current !== sessionId) options.commitTranscript(sessionId, []);
       const message = messageReadErrorMessage(error, options.uiLocale);
       options.setMessageLoadErrorBySession((current) => ({
         ...current,
@@ -379,15 +368,8 @@ export function useActiveSessionEvents(options: {
     });
     options.handleEvent(sessionId, event);
   });
-  const beginObservationSeed = useEffectEvent((sessionId: string) => {
-    return options.beginObservationSeed?.(sessionId) ?? 0;
-  });
-  const completeObservationSeed = useEffectEvent((
-    sessionId: string,
-    generation?: number,
-  ) => {
-    options.completeObservationSeed?.(sessionId, generation);
-  });
+  const beginObservationSeed = useEffectEvent(options.beginObservationSeed);
+  const completeObservationSeed = useEffectEvent(options.completeObservationSeed);
   const markSessionEventStreamClosed = useEffectEvent((sessionId: string) => {
     options.setSessionEventHealthBySession((current) => {
       const previous = current[sessionId];
@@ -411,13 +393,8 @@ export function useActiveSessionEvents(options: {
     let observationFailures = 0;
     let observationRetryTimer: ReturnType<typeof globalThis.setTimeout> | undefined;
     let unsubscribeSessionEvents = () => {};
-    const transcript = new DesktopTranscriptRangeStore(activeId);
-    options.setMessageLoadErrorBySession((current) => {
-      if (!current[activeId]) return current;
-      const next = { ...current };
-      delete next[activeId];
-      return next;
-    });
+    const transcript = new desktopTranscript.DesktopTranscriptRangeStore(activeId);
+    clearMessageLoadError(activeId);
     options.setSessionEventHealthBySession((current) => ({
       ...current,
       [activeId]: createSessionEventStreamSubscription({
@@ -431,11 +408,9 @@ export function useActiveSessionEvents(options: {
         (batch) => {
           if (disposed) return;
           try {
-            if (transcript.accept(batch)) {
-              applyTranscript(activeId, transcript, () => disposed);
-            }
+            transcript.accept(batch);
           } catch (error) {
-            applyReadError(activeId, error, () => disposed);
+            applyReadError(activeId, error);
           }
         },
         (cancel) => {
@@ -443,14 +418,18 @@ export function useActiveSessionEvents(options: {
           else signal.addEventListener('abort', cancel, { once: true });
         },
       );
-    const controller = createDesktopTranscriptRangeController(transcript, openTranscript);
-    void controller.ready().catch((error) => {
-      applyReadError(activeId, error, () => disposed);
-    });
-    options.transcriptRangeRef.current = controller;
+    const controller = desktopTranscript.createRecoveringDesktopTranscriptRangeController(
+      transcript,
+      openTranscript,
+      {
+        onError: (error) => { if (!disposed) applyReadError(activeId, error); },
+      },
+    );
+    const unsubscribeTranscript = transcript.subscribe(() =>
+      applyTranscript(activeId, controller, () => !disposed));
     const subscribeSessionEvents = () => {
       const attempt = ++observationAttempt;
-      const observationGeneration = beginObservationSeed(activeId);
+      beginObservationSeed(activeId);
       let unsubscribeRequested = false;
       let unsubscribeCurrent = () => {
         unsubscribeRequested = true;
@@ -461,18 +440,19 @@ export function useActiveSessionEvents(options: {
           if (attempt !== observationAttempt) return;
           handleSessionEvent(activeId, event);
         },
-        () => {
-          if (attempt !== observationAttempt) return;
-          observationFailures = 0;
-          completeObservationSeed(activeId, observationGeneration);
-        },
         (phase) => {
           if (attempt !== observationAttempt) return;
+          controller.observationChanged(phase);
           if (phase === 'pending') beginObservationSeed(activeId);
-          else completeObservationSeed(activeId);
+          else {
+            observationFailures = 0;
+            completeObservationSeed(activeId);
+          }
         },
         () => {
-          if (disposed || attempt !== observationAttempt) return;
+          if (attempt !== observationAttempt) return;
+          controller.observationChanged('pending');
+          options.setExecution(activeId, undefined);
           unsubscribeCurrent();
           observationFailures += 1;
           const retryDelayMs = Math.min(100 * (2 ** (observationFailures - 1)), 2_000);
@@ -480,6 +460,9 @@ export function useActiveSessionEvents(options: {
             observationRetryTimer = undefined;
             if (!disposed && attempt === observationAttempt) subscribeSessionEvents();
           }, retryDelayMs);
+        },
+        (projection) => {
+          if (attempt === observationAttempt) options.setExecution(activeId, projection);
         },
       );
       unsubscribeCurrent = unsubscribe;
@@ -497,10 +480,12 @@ export function useActiveSessionEvents(options: {
         options.transcriptRangeRef.current = undefined;
       }
       void controller.close();
+      unsubscribeTranscript();
       unsubscribeSessionEvents();
+      options.setExecution(activeId, undefined);
       markSessionEventStreamClosed(activeId);
     };
-  }, [activeId, options.activeProfileId]);
+  }, [activeId, options.observationAuthorityRevision]);
 }
 
 export function useShellRunUpdates(options: {

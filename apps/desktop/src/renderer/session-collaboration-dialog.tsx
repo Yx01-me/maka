@@ -30,6 +30,7 @@ import {
   useToast,
   useUiLocale,
 } from '@maka/ui';
+import { reportUnexpectedError } from './application/contracts/operation-diagnostics.js';
 import type {
   CollaborationAccessQueryResult,
   CollaborationInvitationPrepareResult,
@@ -37,7 +38,11 @@ import type {
   SessionTurnAccessRequest,
 } from '@maka/runtime-host/protocol';
 import { getSessionCollaborationCopy } from './locales/session-collaboration-copy.js';
-import { turnRequestStateLabel } from './session-turn-request-composer.js';
+import {
+  describeTurnRequestIntent,
+  turnRequestStateLabel,
+  SessionGuestAliasAction,
+} from './features/session-collaboration';
 
 type Props = {
   readonly target?: {
@@ -178,7 +183,8 @@ function ShareSessionDialog(props: ShareSessionDialogProps) {
       setInvitation(created.invitation);
       await refresh();
     } catch (error) {
-      toast.error(copy.shareTitle, errorMessage(error));
+      reportUnexpectedError('session-collaboration:prepare', error);
+      toast.error(copy.shareTitle, copy.operationFailed);
     } finally {
       setWorking(false);
     }
@@ -196,7 +202,8 @@ function ShareSessionDialog(props: ShareSessionDialogProps) {
       await navigator.clipboard.writeText(invitation.invitationCode);
       toast.success(copy.copied);
     } catch (error) {
-      toast.error(copy.shareTitle, errorMessage(error));
+      reportUnexpectedError('session-collaboration:copy', error);
+      toast.error(copy.shareTitle, copy.copyFailed);
     }
   }
 
@@ -206,7 +213,8 @@ function ShareSessionDialog(props: ShareSessionDialogProps) {
       await window.maka.sessionCollaboration.revokePrincipal(props.sessionId, principalId);
       await refresh();
     } catch (error) {
-      toast.error(copy.shareTitle, errorMessage(error));
+      reportUnexpectedError('session-collaboration:revoke-principal', error);
+      toast.error(copy.shareTitle, copy.operationFailed);
     } finally {
       setWorking(false);
     }
@@ -221,7 +229,8 @@ function ShareSessionDialog(props: ShareSessionDialogProps) {
       );
       await refresh();
     } catch (error) {
-      toast.error(copy.shareTitle, errorMessage(error));
+      reportUnexpectedError('session-collaboration:revoke-grant', error);
+      toast.error(copy.shareTitle, copy.operationFailed);
     } finally {
       setWorking(false);
     }
@@ -240,7 +249,8 @@ function ShareSessionDialog(props: ShareSessionDialogProps) {
       );
       await refresh();
     } catch (error) {
-      toast.error(copy.turnRequests, errorMessage(error));
+      reportUnexpectedError('session-collaboration:decide-turn-request', error);
+      toast.error(copy.turnRequests, copy.operationFailed);
     } finally {
       setWorking(false);
     }
@@ -333,7 +343,7 @@ function ShareSessionDialog(props: ShareSessionDialogProps) {
                   return (
                     <div className="sessionCollaborationAccessRow" key={principal.principalId}>
                       <div>
-                        <Text type="body">{guestIdentityLabel(principal.principalId, copy.guest)}</Text>
+                        <Text type="body">{principal.displayName ?? guestIdentityLabel(principal.principalId, copy.guest)}</Text>
                         <Text type="supporting" color="secondary">
                           {principal.status === 'pending' ? copy.pending : copy.active}
                           {' · '}
@@ -341,6 +351,8 @@ function ShareSessionDialog(props: ShareSessionDialogProps) {
                         </Text>
                       </div>
                       <div className="sessionCollaborationAccessActions">
+                        <SessionGuestAliasAction sessionId={props.sessionId} principalId={principal.principalId}
+                          displayName={principal.displayName} disabled={working || authorityState !== 'available'} onChanged={refresh} />
                         {requestGrant ? (
                           <Button
                             variant="ghost"
@@ -370,10 +382,11 @@ function ShareSessionDialog(props: ShareSessionDialogProps) {
                   <div className="sessionCollaborationTurnRequest" key={request.requestId}>
                     <div>
                       <Text type="body" className="sessionCollaborationTurnRequestText">
-                        {request.intent.content.text}
+                        {describeTurnRequestIntent(request.intent, copy.regenerateRequest)}
                       </Text>
                       <Text type="supporting" color="secondary">
-                        {guestIdentityLabel(request.principalId, copy.guest)}
+                        {access?.principals.find((principal) => principal.principalId === request.principalId)?.displayName
+                          ?? guestIdentityLabel(request.principalId, copy.guest)}
                         {' · '}
                         {turnRequestStateLabel(request, copy)}
                       </Text>
@@ -428,8 +441,4 @@ function ShareSessionDialog(props: ShareSessionDialogProps) {
 function guestIdentityLabel(principalId: string, label: string): string {
   const identity = principalId.includes(':') ? principalId.slice(principalId.lastIndexOf(':') + 1) : principalId;
   return `${label} ${identity.slice(0, 8)}`;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

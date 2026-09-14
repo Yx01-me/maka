@@ -24,19 +24,26 @@ export {
 } from './services-context.js';
 export type {
   ApiKeyOnboardingBridge,
+  ConnectionOAuthBridge,
+  ConnectionOAuthProviderBridge,
   ConnectionSettingsServices,
   ConnectionsBridge,
   DesktopConnectionOnboardingIdentity,
   RuntimeHostSettingsConnectionsBridge,
 } from './ports.js';
 export {
-  categoryLabel,
   connectionLastTestMessageDisplay,
   connectionTestFailureMessage,
   providerPanelActionErrorMessage,
 } from './provider-panel-shared.js';
-export { getProviderSettingsCopy } from './settings-provider-copy.js';
+export { OnboardingStepForm } from './onboarding-step-form.js';
+export { getProviderSettingsCopy, subscriptionActionErrorMessage, subscriptionResultMessage } from './settings-provider-copy.js';
 export type { ProviderSettingsCopy } from './settings-provider-copy.js';
 export type {
   CredentialPresenceStatus,
 } from './provider-panel-shared.js';
+
+export { GenericProviderMark } from './generic-provider-mark.js';
+export { parseContextWindowInput } from './context-window-input.js';
+export { CapabilityEditor } from './provider-capability-editor.js';
+export { AddModelDialog, ModelParametersDialog } from './provider-add-model-dialog.js';

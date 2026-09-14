@@ -22,9 +22,12 @@ import {
   isProductReleaseVersion,
   isSha512PackageIntegrity,
 } from '@maka/runtime-host/operator/update-package-evidence';
-import type { RuntimeHostManagedUpdatePolicy } from '@maka/runtime-host/operator';
 import {
+  createRuntimeHostLegacyPosixOperatorCommand,
+  decodeRuntimeHostPosixOperatorCommand,
   decodeRuntimeHostWebRtcStunPolicy,
+  type RuntimeHostManagedUpdatePolicy,
+  type RuntimeHostPosixOperatorCommand,
   type RuntimeHostWebRtcStunPolicy,
 } from '@maka/runtime-host/operator';
 import {
@@ -36,8 +39,16 @@ import {
 } from '@maka/runtime-host/protocol';
 import type { RuntimeHostManagedServiceTarget } from './runtime-host-service-manager.js';
 import { hasEphemeralRuntimeHostPeerPort } from './runtime-host-peer-artifact.js';
+import type { RuntimeHostInstalledUpdateExpectedSource } from './runtime-host-installed-update-coordinator.js';
+import {
+  installedUpdateHelpText,
+  isRuntimeHostHelpTopic,
+  runtimeHostCommandHelpText,
+  runtimeHostHelpText,
+} from './runtime-host-help.js';
 
 type RuntimeHostCliError = { kind: 'error'; message: string; exitCode: number };
+type RuntimeHostCliHelp = { kind: 'help'; text: string };
 
 export type RuntimeHostUpdateSelector =
   | { readonly kind: 'channel'; readonly channel: 'latest' | 'next' }
@@ -78,6 +89,7 @@ export type RuntimeHostCliCommand =
       targetIntegrity: string;
       targetCompatibility?: number;
       allowInterruptActiveTasks: boolean;
+      expectedSource?: RuntimeHostInstalledUpdateExpectedSource;
     }
   | {
       kind: 'runtime-host-local-update-activate';
@@ -137,6 +149,8 @@ export type RuntimeHostCliCommand =
       bindPairingToClient?: true;
       repairRootAfterRemount?: true;
       updateExisting?: true;
+      reuseExistingEnvironment?: true;
+      allowInterruptActiveTasks?: true;
       clientDataRoot?: string;
       rootPath?: string;
       projectDirectoryRoots?: { label: string; path: string }[];
@@ -170,6 +184,7 @@ export type RuntimeHostCliCommand =
       websocketPath?: string;
       expectedTarget?: RuntimeHostManagedServiceTarget;
       expectedConfigFingerprint?: string;
+      expectedHost?: RuntimeHostExpectedHost;
       retainManagedDeployment?: true;
       allowInterruptActiveTasks?: true;
     }
@@ -232,6 +247,8 @@ export type RuntimeHostCliCommand =
       operatorDeploymentId?: string;
       expectedTarget: RuntimeHostManagedServiceTarget;
       expectedHost?: RuntimeHostExpectedHost;
+      expectedConfigFingerprint?: string;
+      expectedSourceVersion?: string;
       selector?: RuntimeHostUpdateSelector;
       allowManualUpdate?: true;
       allowInterruptActiveTasks?: true;
@@ -355,12 +372,6 @@ export type RuntimeHostCliCommand =
             sshPort?: number;
             remotePort: number;
             websocketPath: string;
-          }
-        | {
-            kind: 'libp2p-direct';
-            peerId: string;
-            routeHints: string[];
-            coordinationRelays: string[];
           };
       expectedRootId: string;
       credentialEnv?: string;
@@ -370,13 +381,23 @@ export type RuntimeHostCliCommand =
       id: string;
       name: string;
       distribution: string;
-      operatorPath: string;
+      operator: RuntimeHostPosixOperatorCommand;
       expectedRootId: string;
     }
   | { kind: 'runtime-host-profile-remove'; id: string }
+  | RuntimeHostCliHelp
   | RuntimeHostCliError;
 
-export function parseRuntimeHostCommand(argv: string[]): RuntimeHostCliCommand {
+export function parseRuntimeHostCommand(
+  argv: string[],
+  cliCommand = 'maka',
+): RuntimeHostCliCommand {
+  if (!argv[0] || argv[0] === '--help' || argv[0] === '-h') {
+    return { kind: 'help', text: runtimeHostHelpText(cliCommand) };
+  }
+  if ((argv[1] === '--help' || argv[1] === '-h') && isRuntimeHostHelpTopic(argv[0])) {
+    return { kind: 'help', text: runtimeHostCommandHelpText(cliCommand, argv[0]) };
+  }
   if (argv[0] === 'activate' || argv[0] === 'connect') {
     return parseManagedRootFramedCommand(argv[0], argv.slice(1));
   }
@@ -393,11 +414,7 @@ export function parseRuntimeHostCommand(argv: string[]): RuntimeHostCliCommand {
     return parseCapabilityProviderCommand(argv.slice(1));
   }
   if (argv[0] === 'profile') return parseProfileCommand(argv.slice(1));
-  return error(
-    argv[0]
-      ? `Unexpected runtime-host command: ${argv[0]}`
-      : 'runtime-host requires the activate, connect, serve, setup, service, access, project, plugin, profile, or capability-provider command',
-  );
+  return error(`Unexpected runtime-host command: ${argv[0]}`);
 }
 
 function parseManagedRootFramedCommand(
@@ -440,7 +457,13 @@ function parseManagedRootFramedCommand(
   };
 }
 
-export function parseRuntimeHostInstalledUpdateCommand(argv: string[]): RuntimeHostCliCommand {
+export function parseRuntimeHostInstalledUpdateCommand(
+  argv: string[],
+  cliCommand = 'maka',
+): RuntimeHostCliCommand {
+  if (argv[0] === '--help' || argv[0] === '-h') {
+    return { kind: 'help', text: installedUpdateHelpText(cliCommand) };
+  }
   let target: string | undefined;
   let allowInterruptActiveTasks = false;
   for (let index = 0; index < argv.length; index += 1) {
@@ -480,6 +503,10 @@ function parseLocalUpdateApply(argv: string[]): RuntimeHostCliCommand {
     '--target-version',
     '--target-integrity',
     '--target-compatibility',
+    '--expected-root-id',
+    '--expected-deployment-revision',
+    '--expected-owner-installation-id',
+    '--expected-host-epoch',
   ]);
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index];
@@ -531,6 +558,30 @@ function parseLocalUpdateApply(argv: string[]): RuntimeHostCliCommand {
   ) {
     return error('runtime-host local-update-apply compatibility is invalid');
   }
+  const expectedValues = [
+    '--expected-root-id',
+    '--expected-deployment-revision',
+    '--expected-owner-installation-id',
+    '--expected-host-epoch',
+  ].map((name) => values.get(name));
+  let expectedSource: RuntimeHostInstalledUpdateExpectedSource | undefined;
+  if (expectedValues.some((value) => value !== undefined)) {
+    if (!expectedValues.every((value) => value !== undefined && isSafeIdentity(value))) {
+      return error(
+        'runtime-host local-update-apply requires one complete expected source identity',
+      );
+    }
+    const [rootId, deploymentRevision, ownerInstallationId, hostEpoch] = expectedValues as string[];
+    if (!/^[a-f0-9]{64}$/u.test(rootId!)) {
+      return error('runtime-host local-update-apply expected Root identity is invalid');
+    }
+    expectedSource = {
+      rootId: rootId!,
+      deploymentRevision: deploymentRevision!,
+      ownerInstallationId: ownerInstallationId!,
+      hostEpoch: hostEpoch!,
+    };
+  }
   return {
     kind: 'runtime-host-local-update-apply',
     rootPath,
@@ -542,6 +593,7 @@ function parseLocalUpdateApply(argv: string[]): RuntimeHostCliCommand {
     targetIntegrity,
     ...(targetCompatibility === undefined ? {} : { targetCompatibility }),
     allowInterruptActiveTasks,
+    ...(expectedSource ? { expectedSource } : {}),
   };
 }
 
@@ -673,6 +725,8 @@ function parseSetupCommand(argv: string[]): RuntimeHostCliCommand {
   let bindPairingToClient = false;
   let repairRootAfterRemount = false;
   let updateExisting = false;
+  let reuseExistingEnvironment = false;
+  let allowInterruptActiveTasks = false;
   let clientDataRoot: string | undefined;
   let enableDirectPeer = false;
   const coordinationRelays: string[] = [];
@@ -721,6 +775,14 @@ function parseSetupCommand(argv: string[]): RuntimeHostCliCommand {
         if (repairRootAfterRemount) return error('Duplicate --repair-root-after-remount');
         repairRootAfterRemount = true;
       },
+      '--allow-interrupt-active-tasks': () => {
+        if (allowInterruptActiveTasks) return error('Duplicate --allow-interrupt-active-tasks');
+        allowInterruptActiveTasks = true;
+      },
+      '--reuse-existing-environment': () => {
+        if (reuseExistingEnvironment) return error('Duplicate --reuse-existing-environment');
+        reuseExistingEnvironment = true;
+      },
       '--update-existing': () => {
         if (updateExisting) return error('Duplicate --update-existing');
         updateExisting = true;
@@ -728,6 +790,21 @@ function parseSetupCommand(argv: string[]): RuntimeHostCliCommand {
     },
   });
   if ('kind' in options) return options;
+  if (
+    reuseExistingEnvironment &&
+    ((lifecycle as string) !== 'on_demand' ||
+      updateExisting ||
+      enableDirectPeer ||
+      deferPairingCommit ||
+      bindPairingToClient)
+  ) {
+    return error(
+      '--reuse-existing-environment requires on-demand local setup without update or remote pairing options',
+    );
+  }
+  if (allowInterruptActiveTasks && !updateExisting) {
+    return error('--allow-interrupt-active-tasks requires --update-existing');
+  }
   if (!principalId || !/^[A-Za-z0-9_.:-]{1,128}$/u.test(principalId)) {
     return error('runtime-host setup requires a valid --principal');
   }
@@ -748,6 +825,8 @@ function parseSetupCommand(argv: string[]): RuntimeHostCliCommand {
     ...(bindPairingToClient ? { bindPairingToClient: true } : {}),
     ...(repairRootAfterRemount ? { repairRootAfterRemount: true } : {}),
     ...(updateExisting ? { updateExisting: true } : {}),
+    ...(reuseExistingEnvironment ? { reuseExistingEnvironment: true } : {}),
+    ...(allowInterruptActiveTasks ? { allowInterruptActiveTasks: true } : {}),
     ...(clientDataRoot ? { clientDataRoot } : {}),
     ...(enableDirectPeer ? { directPeer: { coordinationRelays } } : {}),
   };
@@ -822,6 +901,7 @@ function parseServiceManagementCommand(argv: string[]): RuntimeHostCliCommand {
   let updateTarget: string | undefined;
   let expectedHost: RuntimeHostExpectedHost | undefined;
   let expectedConfigFingerprint: string | undefined;
+  let expectedSourceVersion: string | undefined;
   const flagOptions: Readonly<Record<string, () => void | RuntimeHostCliError>> =
     action === 'uninstall'
       ? {
@@ -878,6 +958,17 @@ function parseServiceManagementCommand(argv: string[]): RuntimeHostCliCommand {
         : {}),
       ...(action === 'update'
         ? {
+            '--expected-source-version': (value: string) => {
+              if (expectedSourceVersion !== undefined)
+                return error('Duplicate --expected-source-version');
+              if (!isProductReleaseVersion(value))
+                return error('--expected-source-version must be an exact package version');
+              expectedSourceVersion = value;
+            },
+          }
+        : {}),
+      ...(action === 'update' || action === 'restart'
+        ? {
             '--expected-host-json': (value: string) => {
               if (expectedHost !== undefined) return error('Duplicate --expected-host-json');
               const parsed = parseExpectedHost(value);
@@ -886,7 +977,7 @@ function parseServiceManagementCommand(argv: string[]): RuntimeHostCliCommand {
             },
           }
         : {}),
-      ...(action === 'configure'
+      ...(action === 'configure' || action === 'update'
         ? {
             '--expected-config-fingerprint': (value: string) => {
               if (expectedConfigFingerprint !== undefined) {
@@ -969,8 +1060,11 @@ function parseServiceManagementCommand(argv: string[]): RuntimeHostCliCommand {
     };
   }
   if (action === 'update') {
-    if (expectedHost && !options.managedRootId) {
-      return error('--expected-host-json requires --managed-root-id');
+    if (
+      (expectedHost || expectedSourceVersion || expectedConfigFingerprint) &&
+      !options.managedRootId
+    ) {
+      return error('Observed Host and deployment fences require --managed-root-id');
     }
     const selector =
       updateTarget === undefined ? undefined : parseUpdateSelector(updateTarget, 'update');
@@ -996,15 +1090,20 @@ function parseServiceManagementCommand(argv: string[]): RuntimeHostCliCommand {
         : {}),
       expectedTarget: options.expectedTarget!,
       ...(expectedHost ? { expectedHost } : {}),
+      ...(expectedConfigFingerprint ? { expectedConfigFingerprint } : {}),
+      ...(expectedSourceVersion ? { expectedSourceVersion } : {}),
       ...(selector ? { selector } : {}),
       ...(allowManualUpdate ? { allowManualUpdate: true } : {}),
       ...(allowInterruptActiveTasks ? { allowInterruptActiveTasks: true } : {}),
     };
   }
+  if (expectedHost && !options.managedRootId)
+    return error('--expected-host-json requires --managed-root-id');
   return {
     kind: 'runtime-host-service-manage',
     action,
     ...options,
+    ...(expectedHost ? { expectedHost } : {}),
     ...(clientDataRoot ? { clientDataRoot } : {}),
     ...(options.managedRootId ? { managedRootId: options.managedRootId } : {}),
     ...(retainManagedDeployment ? { retainManagedDeployment: true } : {}),
@@ -1713,11 +1812,9 @@ function parseProfileCommand(argv: string[]): RuntimeHostCliCommand {
   let sshRemotePort: number | undefined;
   let sshWebSocketPath = '/runtime-host';
   let sshWebSocketPathConfigured = false;
-  let peerId: string | undefined;
   let wslDistribution: string | undefined;
+  let operator: RuntimeHostPosixOperatorCommand | undefined;
   let operatorPath: string | undefined;
-  const peerRouteHints: string[] = [];
-  const peerCoordinationRelays: string[] = [];
   let expectedRootId: string | undefined;
   let credentialEnv: string | undefined;
   for (let index = 1; index < argv.length; index += 1) {
@@ -1731,10 +1828,8 @@ function parseProfileCommand(argv: string[]): RuntimeHostCliCommand {
       argument !== '--ssh-port' &&
       argument !== '--ssh-remote-port' &&
       argument !== '--ssh-websocket-path' &&
-      argument !== '--peer-id' &&
-      argument !== '--peer-route' &&
-      argument !== '--peer-coordination-relay' &&
       argument !== '--wsl-distribution' &&
+      argument !== '--operator-command' &&
       argument !== '--operator-path' &&
       argument !== '--expected-root' &&
       argument !== '--credential-env' &&
@@ -1759,10 +1854,14 @@ function parseProfileCommand(argv: string[]): RuntimeHostCliCommand {
       sshWebSocketPath = parsed;
       sshWebSocketPathConfigured = true;
     }
-    if (argument === '--peer-id') peerId = parsed;
-    if (argument === '--peer-route') peerRouteHints.push(parsed);
-    if (argument === '--peer-coordination-relay') peerCoordinationRelays.push(parsed);
     if (argument === '--wsl-distribution') wslDistribution = parsed;
+    if (argument === '--operator-command') {
+      try {
+        operator = decodeRuntimeHostPosixOperatorCommand(JSON.parse(parsed));
+      } catch {
+        return error('--operator-command must be a valid Runtime Host operator command JSON value');
+      }
+    }
     if (argument === '--operator-path') operatorPath = parsed;
     if (argument === '--expected-root') expectedRootId = parsed;
     if (argument === '--credential-env') credentialEnv = parsed;
@@ -1770,24 +1869,32 @@ function parseProfileCommand(argv: string[]): RuntimeHostCliCommand {
   }
   if (!id) return error('--id is required');
   if (!name) return error('--name is required');
+  if (operator && operatorPath) {
+    return error('--operator-command and --operator-path cannot be combined');
+  }
+  if (operatorPath) {
+    try {
+      operator = createRuntimeHostLegacyPosixOperatorCommand(operatorPath);
+    } catch {
+      return error('--operator-path must be an absolute POSIX path');
+    }
+  }
   if (
     (tlsUrl ? 1 : 0) +
       (plaintextUrl ? 1 : 0) +
       (sshDestination ? 1 : 0) +
-      (peerId ? 1 : 0) +
       (wslDistribution ? 1 : 0) !==
     1
   ) {
     return error(
-      'exactly one of --tls-url, --plaintext-url, --ssh-destination, --peer-id, or --wsl-distribution is required',
+      'exactly one of --tls-url, --plaintext-url, --ssh-destination, or --wsl-distribution is required',
     );
   }
-  if (wslDistribution && !operatorPath) {
-    return error('--wsl-distribution requires --operator-path');
+  if (wslDistribution && !operator) {
+    return error('--wsl-distribution requires --operator-command or --operator-path');
   }
-  if (!wslDistribution && operatorPath) {
-    return error('--operator-path requires --wsl-distribution');
-  }
+  if (!wslDistribution && operatorPath) return error('--operator-path requires --wsl-distribution');
+  if (!wslDistribution && operator) return error('--operator-command requires --wsl-distribution');
   if (wslDistribution && credentialEnv) {
     return error('WSL environment profiles do not accept --credential-env');
   }
@@ -1806,12 +1913,6 @@ function parseProfileCommand(argv: string[]): RuntimeHostCliCommand {
   if (sshDestination && !sshRemotePort) {
     return error('--ssh-destination requires --ssh-remote-port');
   }
-  if (!peerId && (peerRouteHints.length > 0 || peerCoordinationRelays.length > 0)) {
-    return error('peer route options require --peer-id');
-  }
-  if (peerId && peerRouteHints.length === 0 && peerCoordinationRelays.length === 0) {
-    return error('--peer-id requires at least one --peer-route or --peer-coordination-relay');
-  }
   if (sshPort !== undefined && (!Number.isInteger(sshPort) || sshPort < 1 || sshPort > 65_535)) {
     return error('--ssh-port must be an integer between 1 and 65535');
   }
@@ -1828,36 +1929,30 @@ function parseProfileCommand(argv: string[]): RuntimeHostCliCommand {
       id,
       name,
       distribution: wslDistribution,
-      operatorPath: operatorPath!,
+      operator: operator!,
       expectedRootId,
     };
   }
+  const transport = tlsUrl
+    ? ({ kind: 'tls', url: tlsUrl } as const)
+    : plaintextUrl
+      ? ({
+          kind: 'plaintext',
+          url: plaintextUrl,
+          acknowledgement: 'plaintext-bearer-v1',
+        } as const)
+      : ({
+          kind: 'ssh',
+          destination: sshDestination!,
+          ...(sshPort === undefined ? {} : { sshPort }),
+          remotePort: sshRemotePort!,
+          websocketPath: sshWebSocketPath,
+        } as const);
   return {
     kind: 'runtime-host-profile-set',
     id,
     name,
-    transport: tlsUrl
-      ? { kind: 'tls', url: tlsUrl }
-      : plaintextUrl
-        ? {
-            kind: 'plaintext',
-            url: plaintextUrl,
-            acknowledgement: 'plaintext-bearer-v1',
-          }
-        : sshDestination
-          ? {
-              kind: 'ssh',
-              destination: sshDestination,
-              ...(sshPort === undefined ? {} : { sshPort }),
-              remotePort: sshRemotePort!,
-              websocketPath: sshWebSocketPath,
-            }
-          : {
-              kind: 'libp2p-direct',
-              peerId: peerId!,
-              routeHints: peerRouteHints,
-              coordinationRelays: peerCoordinationRelays,
-            },
+    transport,
     expectedRootId,
     ...(credentialEnv ? { credentialEnv } : {}),
   };

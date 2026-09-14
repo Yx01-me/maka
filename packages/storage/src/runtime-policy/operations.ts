@@ -160,11 +160,22 @@ export interface InteractiveOAuthLoginTicket {
 
 export type InteractiveOAuthLoginProvider = Extract<
   ConnectionCatalogEntry['providerType'],
-  'openai-codex' | 'xai-oauth'
+  'openai-codex' | 'xai-oauth' | 'github-copilot'
 >;
 
 export type InteractiveOAuthLoginTarget =
-  | { readonly kind: 'create'; readonly providerType: InteractiveOAuthLoginProvider }
+  | {
+      readonly kind: 'create';
+      readonly providerType: 'openai-codex';
+      readonly slug?: string;
+      readonly name?: string;
+    }
+  | {
+      readonly kind: 'create';
+      readonly providerType: Exclude<InteractiveOAuthLoginProvider, 'openai-codex'>;
+      readonly slug?: never;
+      readonly name?: never;
+    }
   | { readonly kind: 'existing'; readonly connectionId: string };
 
 export interface InteractiveOAuthLoginInput {
@@ -194,6 +205,7 @@ export type BeginInteractiveOAuthLoginResult =
   | { readonly kind: 'connection_not_found' }
   | { readonly kind: 'connection_disabled' }
   | { readonly kind: 'catalog_full' }
+  | { readonly kind: 'slug_taken' }
   | { readonly kind: 'attempt_conflict' }
   | { readonly kind: 'provider_action_unavailable' }
   | { readonly kind: 'credential_not_configured'; readonly status: CredentialStatus }
@@ -216,6 +228,7 @@ export type InteractiveOAuthLoginCompletionResult =
       readonly revision: number;
       readonly connection: InteractiveOAuthConnectionIdentity;
     }
+  | { readonly kind: 'slug_taken' }
   | {
       readonly kind: 'superseded';
       readonly changed: readonly Extract<
@@ -280,6 +293,10 @@ export type BeginConnectionOnboardingResult =
   | { readonly kind: 'target_missing' }
   | { readonly kind: 'provider_unsupported' }
   | { readonly kind: 'catalog_full' }
+  // The create target's caller-requested slug already belongs to another
+  // connection. Nothing is derived or renamed silently — the caller picks a
+  // different slug (or omits it for the derived identity) and retries.
+  | { readonly kind: 'slug_taken' }
   | {
       readonly kind: 'ready';
       readonly ticket: ConnectionOnboardingTicket;
@@ -326,6 +343,10 @@ export type CommitConnectionOnboardingResult =
   // The explicitly targeted connection no longer exists (or changed provider
   // type) between the caller's snapshot and this commit.
   | { readonly kind: 'target_missing' }
+  // The create target's caller-requested slug was taken between begin and
+  // this commit. A derived slug colliding stays `superseded` — a retry
+  // re-derives — but a requested slug is the caller's choice to fix.
+  | { readonly kind: 'slug_taken' }
   // The discovery basis (connection revision, credential, or proxy) changed
   // between begin and complete: committing would bind another endpoint or
   // credential to a model inventory it never produced.

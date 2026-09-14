@@ -46,6 +46,14 @@ describe('WorkHub Coordination stored records', () => {
     } as const;
 
     assert.deepEqual(decodeCanonicalMessage(assigned), assigned);
+    const delegated = { ...assigned, delegationText: 'Inspect the payment retry state' };
+    assert.deepEqual(decodeCanonicalMessage(delegated), delegated);
+    for (const delegationText of ['', '  ', 42, null]) {
+      assert.throws(
+        () => decodeCanonicalMessage({ ...assigned, delegationText }),
+        /Invalid stored message schema/u,
+      );
+    }
   });
 
   test('rejects malformed or widened coordination records', () => {
@@ -187,6 +195,8 @@ describe('WorkHub Coordination stored records', () => {
     } as const;
 
     assert.deepEqual(decodeCanonicalMessage(replacement), replacement);
+    const delegatedReplacement = { ...replacement, delegationText: 'Fix the login retry loop' };
+    assert.deepEqual(decodeCanonicalMessage(delegatedReplacement), delegatedReplacement);
     assert.deepEqual(decodeCanonicalMessage(assigned), assigned);
     assert.deepEqual(decodeCanonicalMessage(superseded), superseded);
     assert.deepEqual(decodeCanonicalMessage(aborted), aborted);
@@ -197,6 +207,68 @@ describe('WorkHub Coordination stored records', () => {
     assert.throws(
       () => decodeCanonicalMessage({ ...aborted, reason: 'retry_later' }),
       /Invalid stored message schema/u,
+    );
+  });
+
+  test('decodes exact direct-stop request and observed resolution records', () => {
+    const requested = {
+      type: 'workhub_coordination',
+      id: 'stop-request-id',
+      turnId: 'stop-action',
+      ts: 4,
+      schemaVersion: 3,
+      kind: 'delegation_stop_requested',
+      actionId: 'stop-action',
+      actionFingerprint: FINGERPRINT,
+      coordinationTurnId: 'stop-action',
+      stopsActionId: 'original-action',
+      stopsDelegationId: 'original-delegation',
+      targetSessionId: 'payments',
+      targetMessageId: 'payments-message',
+      targetSessionName: 'Payments',
+      userText: 'Stop Payments',
+    } as const;
+    const resolved = {
+      type: 'workhub_coordination',
+      id: 'stop-resolution-id',
+      turnId: 'stop-action',
+      ts: 5,
+      schemaVersion: 3,
+      kind: 'delegation_stop_resolved',
+      actionId: 'stop-action',
+      actionFingerprint: FINGERPRINT,
+      coordinationTurnId: 'stop-action',
+      stopsActionId: 'original-action',
+      stopsDelegationId: 'original-delegation',
+      targetSessionId: 'payments',
+      targetTurnId: 'payments-turn',
+      outcome: 'stop_delivered',
+    } as const;
+
+    assert.deepEqual(decodeCanonicalMessage(requested), requested);
+    assert.deepEqual(decodeCanonicalMessage(resolved), resolved);
+    for (const invalid of [
+      { ...requested, candidateRef: 'injected' },
+      { ...requested, schemaVersion: 2 },
+      { ...resolved, outcome: 'stopped' },
+      { ...resolved, runId: 'injected' },
+      { ...resolved, targetTurnId: '' },
+      { ...resolved, targetTurnId: undefined },
+      { ...resolved, outcome: 'cancelled_pending' },
+    ]) {
+      assert.throws(() => decodeCanonicalMessage(invalid), /Invalid stored message schema/u);
+    }
+    assert.deepEqual(
+      decodeCanonicalMessage({
+        ...resolved,
+        outcome: 'cancelled_pending',
+        targetTurnId: undefined,
+      }),
+      {
+        ...resolved,
+        outcome: 'cancelled_pending',
+        targetTurnId: undefined,
+      },
     );
   });
 });

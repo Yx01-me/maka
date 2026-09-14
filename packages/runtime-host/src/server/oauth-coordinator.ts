@@ -26,6 +26,13 @@ import {
 } from '@maka/runtime/codex-oauth-enrollment';
 import { OAuthDeviceAuthorizationExpiredError } from '@maka/runtime/oauth-provider-contracts';
 import {
+  GitHubCopilotEntitlementError,
+  GitHubCopilotEntitlementUnavailableError,
+  pollGitHubCopilotDeviceAuthorization,
+  startGitHubCopilotDeviceAuthorization,
+  verifyGitHubCopilotModelEntitlement,
+} from '@maka/runtime/github-copilot-oauth-enrollment';
+import {
   pollXaiDeviceAuthorization,
   startXaiDeviceAuthorization,
 } from '@maka/runtime/xai-oauth-enrollment';
@@ -83,6 +90,9 @@ export interface HostOAuthCoordinatorInput {
   readonly now?: () => number;
   readonly startXaiAuthorization?: typeof startXaiDeviceAuthorization;
   readonly pollXaiAuthorization?: typeof pollXaiDeviceAuthorization;
+  readonly startGitHubCopilotAuthorization?: typeof startGitHubCopilotDeviceAuthorization;
+  readonly pollGitHubCopilotAuthorization?: typeof pollGitHubCopilotDeviceAuthorization;
+  readonly verifyGitHubCopilotEntitlement?: typeof verifyGitHubCopilotModelEntitlement;
   readonly startCodexAuthorization?: typeof startCodexDeviceAuthorization;
   readonly pollCodexAuthorization?: typeof pollCodexDeviceAuthorization;
   readonly exchangeCodexCode?: typeof exchangeCodexDeviceAuthorizationCode;
@@ -125,6 +135,7 @@ export class HostOAuthCoordinator {
     'oauth.login.start': (input, context) => this.#start(input, context.connectionId),
     'oauth.login.query': (input) => this.#query(input.attemptId),
     'oauth.login.cancel': (input) => this.#cancel(input.attemptId),
+    'oauth.enrollment.query': (input) => this.#enrollment(input.provider),
   };
 
   readonly #runtimePolicy: RuntimePolicyStoresWriter;
@@ -138,6 +149,9 @@ export class HostOAuthCoordinator {
   readonly #now: () => number;
   readonly #startXaiAuthorization: typeof startXaiDeviceAuthorization;
   readonly #pollXaiAuthorization: typeof pollXaiDeviceAuthorization;
+  readonly #startGitHubCopilotAuthorization: typeof startGitHubCopilotDeviceAuthorization;
+  readonly #pollGitHubCopilotAuthorization: typeof pollGitHubCopilotDeviceAuthorization;
+  readonly #verifyGitHubCopilotEntitlement: typeof verifyGitHubCopilotModelEntitlement;
   readonly #startCodexAuthorization: typeof startCodexDeviceAuthorization;
   readonly #pollCodexAuthorization: typeof pollCodexDeviceAuthorization;
   readonly #exchangeCodexCode: typeof exchangeCodexDeviceAuthorizationCode;
@@ -165,6 +179,12 @@ export class HostOAuthCoordinator {
     this.#now = input.now ?? Date.now;
     this.#startXaiAuthorization = input.startXaiAuthorization ?? startXaiDeviceAuthorization;
     this.#pollXaiAuthorization = input.pollXaiAuthorization ?? pollXaiDeviceAuthorization;
+    this.#startGitHubCopilotAuthorization =
+      input.startGitHubCopilotAuthorization ?? startGitHubCopilotDeviceAuthorization;
+    this.#pollGitHubCopilotAuthorization =
+      input.pollGitHubCopilotAuthorization ?? pollGitHubCopilotDeviceAuthorization;
+    this.#verifyGitHubCopilotEntitlement =
+      input.verifyGitHubCopilotEntitlement ?? verifyGitHubCopilotModelEntitlement;
     this.#startCodexAuthorization = input.startCodexAuthorization ?? startCodexDeviceAuthorization;
     this.#pollCodexAuthorization = input.pollCodexAuthorization ?? pollCodexDeviceAuthorization;
     this.#exchangeCodexCode = input.exchangeCodexCode ?? exchangeCodexDeviceAuthorizationCode;
@@ -265,6 +285,9 @@ export class HostOAuthCoordinator {
     if (admitted.kind === 'catalog_full') {
       return operationConflict('OAuth Connection capacity is exhausted');
     }
+    if (admitted.kind === 'slug_taken') {
+      return slugTaken('OAuth Connection slug is already in use');
+    }
     if (admitted.kind === 'attempt_conflict') {
       return invalidRequest('OAuth attemptId is already bound to another connection');
     }
@@ -348,6 +371,16 @@ export class HostOAuthCoordinator {
     return { ok: true, result: projection(attempt) };
   }
 
+  // The Host owns the enrollment gate: whether a provider may begin an
+  // interactive login is this Host's answer, and only the Host has it. Surfaces
+  // read it to avoid presenting a primary action that a default install refuses.
+  #enrollment(provider: OAuthLoginProvider): Promise<OperationOutcome<'oauth.enrollment.query'>> {
+    return Promise.resolve({
+      ok: true,
+      result: { provider, enabled: this.#isProviderEnabled(provider) },
+    });
+  }
+
   #requestCancellation(attempt: ActiveLoginAttempt, reason: Error): void {
     attempt.cancelRequested = true;
     if (attempt.cancellationDeferred) return;
@@ -364,9 +397,8 @@ export class HostOAuthCoordinator {
           attempt.ticket.secretMaterial.networkProxy?.secret,
         ),
       );
-      // Switched rather than defaulted: with the retired provider gone the
-      // union is two wide, and a ternary would route any future third member
-      // into the Codex device flow without a compiler error.
+      // Switched rather than defaulted: routing any future provider into an
+      // unrelated device flow must be a compiler error, not a silent default.
       const tokens = await this.#runProviderLogin(attempt, transport.fetch);
       attempt.abort.signal.throwIfAborted();
       attempt.cancellationDeferred = true;
@@ -376,6 +408,9 @@ export class HostOAuthCoordinator {
           attempt.ticket.ticket,
           serializeOAuthSubscriptionTokens(tokens),
         );
+        if (completion.kind === 'slug_taken') {
+          throw new LoginFailure('slug_taken');
+        }
         if (completion.kind !== 'committed') {
           throw new LoginFailure(
             completion.changed.includes('connection') ? 'connection_changed' : 'credential_changed',
@@ -452,7 +487,46 @@ export class HostOAuthCoordinator {
         return this.#runXaiLogin(attempt, fetchFn);
       case 'openai-codex':
         return this.#runCodexDeviceLogin(attempt, fetchFn);
+      case 'github-copilot':
+        return this.#runGitHubCopilotLogin(attempt, fetchFn);
     }
+  }
+
+  async #runGitHubCopilotLogin(attempt: ActiveLoginAttempt, fetchFn: typeof fetch) {
+    const authorization = await this.#startGitHubCopilotAuthorization({
+      fetchFn,
+      signal: attempt.abort.signal,
+      now: this.#now,
+    });
+    await this.#present(attempt, {
+      method: 'open_external',
+      url: authorization.verificationUrl,
+      stateHint: authorization.userCode,
+    });
+    attempt.phase = 'exchanging';
+    const tokens = await this.#pollGitHubCopilotAuthorization({
+      authorization,
+      fetchFn,
+      signal: attempt.abort.signal,
+      now: this.#now,
+      onPollAdmission: () => {
+        attempt.cancellationDeferred = true;
+      },
+      onPollRetry: () => {
+        attempt.cancellationDeferred = false;
+        if (attempt.cancelRequested) {
+          this.#requestCancellation(
+            attempt,
+            new DOMException('OAuth login cancelled', 'AbortError'),
+          );
+        }
+      },
+    });
+    // A GitHub account is not a Copilot subscription. Adopt the account only
+    // once the provider says it can reach a model, so the commit below never
+    // stores a credential the connection cannot use.
+    await this.#verifyGitHubCopilotEntitlement({ tokens, fetchFn });
+    return tokens;
   }
 
   async #runXaiLogin(attempt: ActiveLoginAttempt, fetchFn: typeof fetch) {
@@ -588,7 +662,10 @@ function sameOAuthLoginTarget(actual: OAuthLoginTarget, expected: OAuthLoginTarg
   return (
     actual.kind === expected.kind &&
     (actual.kind === 'create'
-      ? expected.kind === 'create' && actual.providerType === expected.providerType
+      ? expected.kind === 'create' &&
+        actual.providerType === expected.providerType &&
+        actual.slug === expected.slug &&
+        actual.name === expected.name
       : expected.kind === 'existing' && actual.connectionId === expected.connectionId)
   );
 }
@@ -596,6 +673,13 @@ function sameOAuthLoginTarget(actual: OAuthLoginTarget, expected: OAuthLoginTarg
 function loginFailureCode(error: unknown): OAuthLoginFailureCode {
   if (error instanceof LoginFailure) return error.code;
   if (error instanceof RuntimePolicyStoreError) return 'persistence_failed';
+  // The account authorized the grant and the provider then refused it: the
+  // login worked, the subscription behind it did not.
+  if (error instanceof GitHubCopilotEntitlementError) return 'provider_rejected';
+  // The provider never answered the entitlement question. Nothing is known
+  // about the subscription, so this is a login that did not complete — the
+  // user retries, they do not go looking for a plan they already have.
+  if (error instanceof GitHubCopilotEntitlementUnavailableError) return 'authorization_failed';
   // A local device window that elapsed without approval is a timeout, not
   // a provider rejection of the account.
   if (error instanceof OAuthDeviceAuthorizationExpiredError) return 'authorization_failed';
@@ -629,6 +713,10 @@ function operationUnavailable(message: string) {
 
 function operationConflict(message: string) {
   return { ok: false, error: { code: 'operation_conflict', message } } as const;
+}
+
+function slugTaken(message: string) {
+  return { ok: false, error: { code: 'slug_taken', message } } as const;
 }
 
 function hostDraining(): OperationOutcome<'oauth.login.start'> {

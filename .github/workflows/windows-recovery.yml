@@ -75,6 +75,7 @@ on:
       - 'packages/runtime-host/src/__tests__/skill-catalog-two-client-uds.test.ts'
       - 'packages/runtime-host/src/client/client-instance-identity.ts'
       - 'packages/runtime-host/src/client/host-profile.ts'
+      - 'packages/runtime-host/src/client/ssh-operator-activation.ts'
       - 'packages/runtime-host/src/client/ssh-tunnel.ts'
       - 'packages/runtime-host/src/client/wsl-control.ts'
       - 'packages/runtime-host/src/control/access-credential-delivery.ts'
@@ -83,11 +84,14 @@ on:
       - 'packages/runtime-host/src/control/startup-diagnostic.ts'
       - 'packages/runtime-host/src/operator/local-deployment-owner.ts'
       - 'packages/runtime-host/src/operator/managed-deployment.ts'
-      - 'packages/runtime-host/src/peer-mesh/owner.ts'
+      - 'packages/runtime-host/src/operator/operator-command.ts'
       - 'packages/runtime-host/src/peer-mesh/store.ts'
+      - 'packages/runtime-host/src/peer-reachability/owner.ts'
+      - 'packages/runtime-host/src/peer-reachability/publisher.ts'
       - 'packages/runtime-host/src/protocol/host-status.ts'
       - 'packages/runtime-host/src/protocol/skill-catalog.ts'
       - 'packages/runtime-host/src/server/access-credential-store.ts'
+      - 'packages/runtime-host/src/server/host-resource-probe.ts'
       - 'packages/runtime-host/src/server/skill-catalog-repository.ts'
       - 'packages/runtime-host/src/server/skill-catalog-transaction.ts'
       - 'packages/runtime/src/__tests__/runtime-continuation-crash.test.ts'
@@ -100,6 +104,8 @@ on:
       - 'packages/runtime/src/pipe-process-driver.ts'
       - 'packages/runtime/src/process-tree-terminator.ts'
       - 'packages/runtime/src/pty-process-driver.ts'
+      - 'packages/runtime/src/ripgrep-guidance.ts'
+      - 'packages/runtime/src/ripgrep-executable.ts'
       - 'packages/runtime/src/sandbox-boundary-declaration.ts'
       - 'packages/runtime/src/sandbox/default-sandbox-manager.ts'
       - 'packages/runtime/src/sandbox/sandbox-manager.ts'
@@ -112,7 +118,7 @@ on:
       - 'packages/storage/src/artifact-store.ts'
       - 'packages/storage/src/artifact-writer-bootstrap-lock.ts'
       - 'packages/storage/src/artifact-writer-lock.ts'
-      - 'packages/storage/src/credential-store.ts'
+      - 'packages/storage/src/atomic-file-write.ts'
       - 'packages/storage/src/file-lifetime-owner.ts'
       - 'packages/storage/src/managed-dependency-environment.ts'
       - 'packages/storage/src/marker-file.ts'
@@ -120,6 +126,7 @@ on:
       - 'packages/storage/src/native-file-lock.ts'
       - 'packages/storage/src/root-authority.ts'
       - 'packages/storage/src/runtime-policy/document-io.ts'
+      - 'packages/storage/src/session-bundle-file-service.ts'
       - 'packages/storage/src/sqlite-long-term-memory-store.ts'
       - 'packages/storage/src/stable-storage.ts'
       - '.github/workflows/windows-recovery.yml'
@@ -222,8 +229,8 @@ jobs:
           $exitCode = $LASTEXITCODE
           if ($exitCode -ne 0) { exit $exitCode }
           $output = Get-Content "$env:RUNNER_TEMP/skill-catalog.tap"
-          if ($output -notcontains '# tests 91' -or $output -notcontains '# pass 91' -or $output -notcontains '# skipped 0') {
-            Write-Error 'Skill catalog gate did not run exactly 91 passing Windows tests'
+          if ($output -notcontains '# tests 93' -or $output -notcontains '# pass 93' -or $output -notcontains '# skipped 0') {
+            Write-Error 'Skill catalog gate did not run exactly 93 passing Windows tests'
             exit 1
           }
 

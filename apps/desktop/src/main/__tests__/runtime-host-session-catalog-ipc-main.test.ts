@@ -41,6 +41,10 @@ test('maps Runtime Host live run state without collapsing unknown and known-empt
   assert.deepEqual(running.runningTurnIds, ['turn-live']);
 });
 
+test('preserves the Session revision in Owner Desktop Host summaries', () => {
+  assert.equal(toDesktopHostSessionSummary(projection({ revision: 7 })).revision, 7);
+});
+
 test('session creation forwards the caller name for a mode that carries none', async () => {
   const creates: SessionCreateInput[] = [];
   const ipc = ipcHarness();
@@ -55,6 +59,26 @@ test('session creation forwards the caller name for a mode that carries none', a
       ['bot', '飞书 任务'],
       ['deep_research', '飞书 任务'],
     ],
+  );
+});
+
+test('session creation forwards a plugin executor without a model target', async () => {
+  const creates: SessionCreateInput[] = [];
+  const ipc = ipcHarness();
+  registerRuntimeHostSessionCatalogIpc(createDeps(creates), ipc as unknown as IpcMain);
+
+  await ipc.invoke('sessions:create', { executorId: 'codex.app-server' });
+
+  assert.equal(creates[0]?.executorId, 'codex.app-server');
+  assert.equal(creates[0]?.modelTarget, undefined);
+  await assert.rejects(
+    ipc.invoke('sessions:create', {
+      executorId: 'codex',
+      llmConnectionId: 'connection-1',
+      llmConnectionSlug: 'openai',
+      model: 'gpt-5',
+    }),
+    /cannot include a model target/,
   );
 });
 

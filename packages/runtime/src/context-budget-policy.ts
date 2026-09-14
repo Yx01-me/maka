@@ -18,8 +18,12 @@
  */
 
 import type { RuntimeExecutionConnection } from '@maka/core/llm-connections';
-import { lookupModelMetadata } from '@maka/core/model-metadata';
-import { relayModelProfile } from '@maka/core/model-thinking';
+import {
+  declaredContextWindow,
+  modelOverride,
+  resolveModelLimits,
+  modelLimitsConflict,
+} from '@maka/core/model-thinking';
 import type { ContextBudgetPolicy } from './context-budget.js';
 
 export interface BuildDefaultContextBudgetPolicyOptions {
@@ -27,66 +31,44 @@ export interface BuildDefaultContextBudgetPolicyOptions {
   modelId?: string;
 }
 
+/**
+ * The shipped context-budget policy. It carries no history budget and no
+ * reserve: whether a request fits is the provider's answer, and the only
+ * proactive threshold is the context window the user declared for the model
+ * (see `resolveDeclaredContextWindow`), read by the compaction seam itself.
+ * What remains here are content policies — how one oversized Tool Result
+ * enters the request — and the compaction switches (#4559).
+ */
 export function buildDefaultContextBudgetPolicy(
-  connection: RuntimeExecutionConnection,
   options: BuildDefaultContextBudgetPolicyOptions = {},
 ): ContextBudgetPolicy {
-  const contextWindow = resolveSelectedModelContextWindow(connection, options.modelId);
-  const reserveTokens = defaultCompactReserveTokens(contextWindow);
-  const maxHistoryEstimatedTokens = defaultHistoryBudgetTokens(
-    connection,
-    contextWindow,
-    reserveTokens,
-  );
   const surfaceName = (options.name ?? 'default-history-budget').replace(
     /-default-history-budget$/,
     '',
   );
   return {
     name: options.name ?? 'default-history-budget',
-    ...(maxHistoryEstimatedTokens !== undefined ? { maxHistoryEstimatedTokens } : {}),
-    staleToolResultPrune: {
-      enabled: true,
-      maxResultEstimatedTokens: 2_048,
-      minRecentTurnsFull: 2,
-    },
+    toolResultPrune: { enabled: true },
     historyCompact: {
       enabled: true,
       highWaterName: `${surfaceName}-history-compact`,
-      midTurn: { enabled: true, reserveTokens },
-    },
-    activeToolResultPrune: {
-      enabled: true,
-      maxCurrentResultEstimatedTokens: 2_048,
-      minSupersededResultEstimatedTokens: 256,
-      minStepNumber: 1,
+      midTurn: { enabled: true },
     },
   };
 }
 
-// Single owner of the compaction reserve default. The classic 16384 reserve
-// assumed large-window models; on an 8K window it derived a 1-token history
-// budget and a 1-token mid_turn high water — every multi-step turn ran the
-// summarizer for a checkpoint the replay gate could never admit. The default
-// is therefore bounded by the KNOWN window (a quarter of it, capped at 16384;
-// peers bound the same way: opencode caps its buffer by the model's output
-// limit, gemini-cli triggers at a window fraction). An unknown window keeps
-// the classic constant.
-function defaultCompactReserveTokens(contextWindow: number | undefined): number {
-  if (contextWindow === undefined) return 16_384;
-  return Math.min(16_384, Math.max(1, Math.floor(contextWindow / 4)));
-}
-
-function defaultHistoryBudgetTokens(
+/**
+ * The Maka window for the selected model: the context window the user declared,
+ * resolved by core's single owner of that rule (`declaredContextWindow`), or
+ * undefined when nothing is declared — and then no proactive compaction runs.
+ */
+export function resolveDeclaredContextWindow(
   connection: RuntimeExecutionConnection,
-  contextWindow: number | undefined,
-  reserveTokens: number,
+  modelId: string | undefined,
 ): number | undefined {
-  if (contextWindow !== undefined) {
-    return Math.max(1, contextWindow - reserveTokens);
-  }
-  if (connection.providerType === 'deepseek') return undefined;
-  return 32_000;
+  const selectedModelId = modelId ?? connection.defaultModel;
+  if (selectedModelId === undefined) return undefined;
+  return declaredContextWindow(connection, selectedModelId);
 }
 
 export function resolveSelectedModelContextWindow(
@@ -96,27 +78,15 @@ export function resolveSelectedModelContextWindow(
   const selectedModelId = modelId ?? connection.defaultModel;
   if (selectedModelId === undefined) return undefined;
   const model = connection.models?.find((candidate) => candidate.id === selectedModelId);
-  // A model-facts pin is the cross-provider correction authority. It must win
-  // over the older relay-only declaration so catalog display and execution use
-  // the same window. Relay declarations retain their existing precedence when
-  // there is no facts pin for this field.
-  if (model?.factOverriddenFields?.includes('contextWindow')) {
-    return narrowestPositiveLimit(model.contextWindow, model.inputLimit);
-  }
-  // A user declaration outranks both the provider's /models report and
-  // generated metadata — mirrors the declared-vision precedence in
-  // model-metadata.ts. A declared context window is legal on any provider: it
-  // states a fact about the model, not a request shape (#1584).
-  const declared = relayModelProfile(connection, selectedModelId)?.contextWindow;
-  if (declared !== undefined) return declared;
-  const metadata = lookupModelMetadata(connection.providerType, selectedModelId);
-  // Provider/access-path facts outrank static metadata. Within one source,
-  // use the narrowest positive bound: models.dev's input limit can be lower
-  // than its total context window, while an access path can expose a narrower
-  // context window than the public catalog.
-  const modelLimit = narrowestPositiveLimit(model?.contextWindow, model?.inputLimit);
-  const metadataLimit = narrowestPositiveLimit(metadata.contextWindow, metadata.inputLimit);
-  return modelLimit ?? metadataLimit;
+  // Resolve each fact independently before deriving the input budget.
+  const limits = resolveModelLimits(
+    connection.providerType,
+    model ?? { id: selectedModelId },
+    connection.modelOverrides?.[selectedModelId],
+  );
+  if (modelLimitsConflict(limits))
+    throw new Error('Model input limit exceeds the context window. Update the model limits.');
+  return narrowestPositiveLimit(limits.contextWindow, limits.inputLimit);
 }
 
 function narrowestPositiveLimit(...values: Array<number | undefined>): number | undefined {

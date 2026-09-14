@@ -54,6 +54,8 @@ type OpenAiCompatibleRuntimeAdapterBase = {
   requireBaseUrl?: boolean;
   replayAssistantReasoningAs?: 'reasoning';
   replayAssistantReasoningDetails?: true;
+  normalizeUsage?: true;
+  normalizeBaseUrl?: true;
 };
 
 type OpenAiCompatibleRuntimeAdapter = OpenAiCompatibleRuntimeAdapterBase &
@@ -71,7 +73,12 @@ type OpenAiCompatibleRuntimeAdapter = OpenAiCompatibleRuntimeAdapterBase &
   );
 
 type ProviderRuntimeAdapterDefinition =
-  | { kind: 'anthropic'; auth: 'api-key' | 'bearer'; normalizeBaseUrl: boolean }
+  | {
+      kind: 'anthropic';
+      auth: 'api-key' | 'bearer';
+      normalizeBaseUrl: boolean;
+      includeBetaHeaders?: false;
+    }
   /**
    * No Runtime adapter claims this provider, so nothing can be sent through it.
    * Distinct from a provider that was never wired: see `retired`.
@@ -80,7 +87,6 @@ type ProviderRuntimeAdapterDefinition =
   | { kind: 'openai'; apiProtocol?: 'openai-chat' | 'openai-responses' }
   | { kind: 'openai-codex' }
   | { kind: 'google'; normalizeBaseUrl?: boolean }
-  | { kind: 'github-copilot' }
   | { kind: 'cohere' }
   | OpenAiCompatibleRuntimeAdapter;
 
@@ -96,6 +102,7 @@ export type ProviderModelDiscovery =
       path?: string;
       query?: Readonly<Record<string, string>>;
       responseShape?: 'array-or-data';
+      modelProtocols?: 'commandcode';
       filter?: 'language-models' | 'tool-capable';
     }
   | {
@@ -134,13 +141,15 @@ export interface ProviderDefaults {
   enableShippedModelsByDefault?: true;
   status: 'ready' | 'phase3-experimental';
   runtimeAdapter: ProviderRuntimeAdapter;
+  /** Additional request protocols; omitted models still use runtimeAdapter. */
+  protocolAdapters?: Partial<
+    Record<'openai-chat' | 'openai-responses' | 'anthropic-messages', ProviderRuntimeAdapter>
+  >;
   /**
    * Maka used to offer this provider and no longer does. The entry stays
    * registered so stored connections still decode; it just cannot be used.
    */
   retired?: true;
-  /** User-declared per-model capabilities are authoritative for this provider. */
-  relayModelProfiles?: boolean;
   /**
    * Models with dated evidence of persistent breakage whose failure shape the
    * send itself cannot surface (e.g. empty completions that still bill).
@@ -153,6 +162,13 @@ export interface ProviderDefaults {
   catalogGroup?: ProviderCatalogGroup;
   signupUrl?: string;
   catalogOrder?: number;
+  /**
+   * Position in the catalog's 推荐 shortlist. Only for the providers a new
+   * user can finish setting up without leaving Maka: no key to buy, no
+   * endpoint to know — a free tier, a plan, or an account sign-in. The
+   * account sign-ins reach the shortlist through their OAuth cards, so the
+   * keyed providers here are the free-tier ones.
+   */
   recommendedOrder?: number;
 }
 
@@ -278,15 +294,15 @@ if (zenmux.api !== 'https://zenmux.ai/api/v1') {
 }
 const zenmuxModelProviderOverrides = GENERATED_MODELS_DEV_MODEL_PROVIDER_OVERRIDES.zenmux;
 if (
-  zenmuxModelProviderOverrides['anthropic/claude-sonnet-4.6']?.npm !== '@ai-sdk/anthropic' ||
-  zenmuxModelProviderOverrides['anthropic/claude-sonnet-4.6']?.api !==
+  zenmuxModelProviderOverrides['anthropic/claude-sonnet-4.6']?.adapter.kind !== 'anthropic' ||
+  zenmuxModelProviderOverrides['anthropic/claude-sonnet-4.6']?.baseUrl !==
     'https://zenmux.ai/api/anthropic/v1'
 ) {
   throw new Error(
     'models.dev ZenMux snapshot is missing its Anthropic model-level protocol override',
   );
 }
-if (zenmuxModelProviderOverrides['openai/gpt-5.4']?.npm !== '@ai-sdk/openai') {
+if (zenmuxModelProviderOverrides['openai/gpt-5.4']?.adapter.kind !== 'openai') {
   throw new Error(
     'models.dev ZenMux snapshot is missing its native OpenAI model-level protocol override',
   );
@@ -353,6 +369,7 @@ const volcengineCodingPlanModelIds = [
 const volcengineAgentPlanModelIds = [
   'ark-code-latest',
   'glm-5.3',
+  'glm-5.3-flash',
   'doubao-seed-2.0-mini',
   'doubao-seed-2.0-lite',
   'deepseek-v4-flash',
@@ -764,7 +781,6 @@ const providerRegistry = {
     catalogGroup: 'api',
     signupUrl: 'https://console.anthropic.com/settings/keys',
     catalogOrder: 9,
-    recommendedOrder: 3,
   },
   'kimi-coding-plan': {
     label: 'Kimi Coding Plan',
@@ -777,12 +793,19 @@ const providerRegistry = {
     fallbackModels: [...kimiCodingPlanModelIds],
     status: 'ready',
     runtimeAdapter: { kind: 'anthropic', auth: 'api-key', normalizeBaseUrl: true },
+    protocolAdapters: {
+      'openai-chat': {
+        kind: 'openai-compatible',
+        name: 'provider',
+        normalizeUsage: true,
+        normalizeBaseUrl: true,
+      },
+    },
     modelDiscovery: { kind: 'protocol' },
     category: 'domestic',
     catalogGroup: 'plans',
     signupUrl: 'https://www.kimi.com/code/console',
     catalogOrder: 1,
-    recommendedOrder: 5,
   },
   'minimax-coding-plan': {
     label: 'MiniMax Coding Plan',
@@ -865,7 +888,6 @@ const providerRegistry = {
     catalogGroup: 'api',
     signupUrl: 'https://platform.openai.com/api-keys',
     catalogOrder: 10,
-    recommendedOrder: 2,
   },
   google: {
     label: 'Google Gemini',
@@ -885,7 +907,6 @@ const providerRegistry = {
     catalogGroup: 'api',
     signupUrl: 'https://aistudio.google.com/app/apikey',
     catalogOrder: 11,
-    recommendedOrder: 4,
   },
   deepseek: {
     label: 'DeepSeek',
@@ -910,7 +931,6 @@ const providerRegistry = {
     catalogGroup: 'api',
     signupUrl: 'https://platform.deepseek.com/api_keys',
     catalogOrder: 3,
-    recommendedOrder: 6,
   },
   moonshot: {
     label: 'Moonshot',
@@ -1168,6 +1188,10 @@ const providerRegistry = {
     fallbackModels: opencodeModelIds,
     status: 'ready',
     runtimeAdapter: { kind: 'openai-compatible', name: 'provider' },
+    protocolAdapters: {
+      'anthropic-messages': { kind: 'anthropic', auth: 'api-key', normalizeBaseUrl: true },
+      'openai-responses': { kind: 'openai', apiProtocol: 'openai-responses' },
+    },
     modelDiscovery: { kind: 'protocol' },
     category: 'overseas',
     catalogGroup: 'plans',
@@ -1181,6 +1205,10 @@ const providerRegistry = {
     fallbackModels: opencodeGoModelIds,
     status: 'ready',
     runtimeAdapter: { kind: 'openai-compatible', name: 'provider' },
+    protocolAdapters: {
+      'anthropic-messages': { kind: 'anthropic', auth: 'api-key', normalizeBaseUrl: true },
+      'openai-responses': { kind: 'openai', apiProtocol: 'openai-responses' },
+    },
     modelDiscovery: { kind: 'protocol' },
     category: 'overseas',
     catalogGroup: 'plans',
@@ -1461,6 +1489,22 @@ const providerRegistry = {
     signupUrl: 'https://modelstudio.console.alibabacloud.com/',
     catalogOrder: 41.4,
   },
+  commandcode: {
+    label: 'Command Code',
+    baseUrl: 'https://api.commandcode.ai/provider/v1',
+    authKind: 'api_key',
+    fallbackModels: [],
+    status: 'ready',
+    runtimeAdapter: { kind: 'openai-compatible', name: 'provider' },
+    protocolAdapters: {
+      'anthropic-messages': { kind: 'anthropic', auth: 'bearer', normalizeBaseUrl: true },
+    },
+    modelDiscovery: { kind: 'protocol', modelProtocols: 'commandcode' },
+    category: 'overseas',
+    catalogGroup: 'plans',
+    signupUrl: 'https://commandcode.ai/docs/plans/goat',
+    catalogOrder: 41.5,
+  },
   'cloudflare-workers-ai': {
     label: cloudflareWorkersAi.name,
     baseUrl: '',
@@ -1509,7 +1553,6 @@ const providerRegistry = {
     category: 'local',
     catalogGroup: 'local',
     catalogOrder: 16,
-    recommendedOrder: 7,
   },
   'lm-studio': {
     label: 'LM Studio',
@@ -1542,12 +1585,10 @@ const providerRegistry = {
     fallbackModels: [],
     status: 'ready',
     runtimeAdapter: { kind: 'openai-compatible', name: 'connection', requireBaseUrl: true },
-    relayModelProfiles: true,
     modelDiscovery: { kind: 'protocol' },
     category: 'custom',
     catalogGroup: 'aggregators',
     catalogOrder: 18,
-    recommendedOrder: 7.5,
   },
   'openai-responses-compatible': {
     label: 'Custom relay (OpenAI Responses)',
@@ -1556,12 +1597,10 @@ const providerRegistry = {
     fallbackModels: [],
     status: 'ready',
     runtimeAdapter: { kind: 'openai', apiProtocol: 'openai-responses' },
-    relayModelProfiles: true,
     modelDiscovery: { kind: 'protocol' },
     category: 'custom',
     catalogGroup: 'aggregators',
     catalogOrder: 18.1,
-    recommendedOrder: 7.6,
   },
   'anthropic-compatible': {
     label: 'Custom relay (Anthropic)',
@@ -1574,7 +1613,6 @@ const providerRegistry = {
     category: 'custom',
     catalogGroup: 'aggregators',
     catalogOrder: 18.2,
-    recommendedOrder: 7.7,
   },
   'github-copilot': {
     label: githubCopilot.name,
@@ -1582,7 +1620,16 @@ const providerRegistry = {
     authKind: 'oauth_token',
     fallbackModels: githubCopilotModelIds,
     status: 'ready',
-    runtimeAdapter: { kind: 'github-copilot' },
+    runtimeAdapter: { kind: 'openai-compatible', name: 'provider', includeUsage: false },
+    protocolAdapters: {
+      'anthropic-messages': {
+        kind: 'anthropic',
+        auth: 'bearer',
+        normalizeBaseUrl: true,
+        includeBetaHeaders: false,
+      },
+      'openai-responses': { kind: 'openai', apiProtocol: 'openai-responses' },
+    },
     modelDiscovery: { kind: 'protocol', auth: 'github-copilot' },
     category: 'oauth',
     signupUrl: 'https://github.com/features/copilot/plans',
@@ -1614,7 +1661,7 @@ const providerRegistry = {
     menuLabel: 'OpenAI OAuth',
     baseUrl: 'https://chatgpt.com/backend-api/codex',
     authKind: 'oauth_token',
-    fallbackModels: ['gpt-5.6-sol', 'gpt-5.5', 'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.3-codex-spark'],
+    fallbackModels: ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'],
     status: 'phase3-experimental',
     runtimeAdapter: { kind: 'openai-codex' },
     modelDiscovery: { kind: 'protocol', auth: 'openai-codex' },

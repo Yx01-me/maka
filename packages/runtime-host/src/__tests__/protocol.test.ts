@@ -211,6 +211,10 @@ describe('Runtime Host bootstrap protocol', () => {
     assert.ok(RUNTIME_HOST_COMPATIBILITY_EPOCH > 38);
   });
 
+  test('publishes a new compatibility epoch for nested Client Capability interactions', () => {
+    assert.ok(RUNTIME_HOST_COMPATIBILITY_EPOCH > 81);
+  });
+
   test('publishes a new compatibility epoch for onboarding endpoint overrides', () => {
     // Epoch 44 peers reject the required `baseUrl` and `connectionId` on
     // onboarding inputs, and the `base_url_not_configured` /
@@ -246,6 +250,20 @@ describe('Runtime Host bootstrap protocol', () => {
     // Side Conversation adds another closed branch-copy input and therefore
     // needs its own later handshake boundary.
     assert.ok(RUNTIME_HOST_COMPATIBILITY_EPOCH > 47);
+  });
+
+  test('publishes a new compatibility epoch for GitHub Copilot logins', () => {
+    // Main is at 101 and open PRs already claim 102. The new OAuth provider,
+    // enrollment query, and onboarding credential shape change the closed wire
+    // vocabulary, so this branch re-derives the first unclaimed epoch.
+    assert.ok(RUNTIME_HOST_COMPATIBILITY_EPOCH > 102);
+  });
+
+  test('publishes a new compatibility epoch for named OAuth identity and slug failures', () => {
+    // Epoch 109 is the current main boundary. Named create inputs and the
+    // slug_taken output extend closed wire shapes, so older peers must be
+    // rejected during handshake rather than failing midway through setup.
+    assert.ok(RUNTIME_HOST_COMPATIBILITY_EPOCH > 109);
   });
 
   test('publishes a new compatibility epoch for context-budget failure detail', () => {
@@ -420,6 +438,24 @@ describe('Runtime Host bootstrap protocol', () => {
 
   test('publishes a new compatibility epoch for catalog model-facts provenance', () => {
     assert.ok(RUNTIME_HOST_COMPATIBILITY_EPOCH > 79);
+  });
+
+  test('publishes a new compatibility epoch for the optional conversation-copy sourceTurnId', () => {
+    assert.ok(RUNTIME_HOST_COMPATIBILITY_EPOCH > 99);
+  });
+
+  test('publishes a new compatibility epoch for external Session import failure reasons', () => {
+    // model_unavailable / source_unreadable let the shell classify import
+    // failures by stable code; older peers cannot decode the new codes.
+    assert.ok(RUNTIME_HOST_COMPATIBILITY_EPOCH > 117);
+  });
+
+  test('publishes a new compatibility epoch for event-addressed transcript cursors', () => {
+    assert.ok(RUNTIME_HOST_COMPATIBILITY_EPOCH > 118);
+  });
+
+  test('publishes a new compatibility epoch for context-compaction transcript state', () => {
+    assert.ok(RUNTIME_HOST_COMPATIBILITY_EPOCH > 124);
   });
 
   test('selects the highest mutually supported protocol and rejects a gap', () => {
@@ -1476,7 +1512,9 @@ describe('Runtime Host bootstrap protocol', () => {
         originHostEpoch: 'epoch-1',
         sessionId: 'session-1',
         messageId: 'message-1',
-        content: { text: 'adjust the active turn' },
+        content: {
+          text: 'adjust the active turn',
+        },
         placement: 'current_turn' as const,
       },
     };
@@ -1897,6 +1935,81 @@ describe('Runtime Host bootstrap protocol', () => {
     );
   });
 
+  test('admits structured-only Messages: empty inline text with quotes or attachments (#4804)', () => {
+    const submit = (content: unknown) =>
+      decodeClientFrame({
+        requestId: 'submit-structured-only',
+        operation: 'turn.message.submit',
+        input: {
+          originHostEpoch: 'epoch-1',
+          sessionId: 'session-1',
+          messageId: 'message-1',
+          content,
+          placement: 'next_turn',
+        },
+      });
+    // A quote or an attachment carries the turn by itself: empty inline text
+    // is admissible when either is present.
+    assert.doesNotThrow(() =>
+      submit({ text: '', quotes: [{ text: 'pasted reference-sized excerpt' }] }),
+    );
+    assert.doesNotThrow(() =>
+      submit({
+        text: '',
+        attachments: [attachmentRef({ kind: 'workspace_file', relativePath: 'a.ts' })],
+      }),
+    );
+    // A Message with nothing but empty text is still an invalid frame.
+    // Whitespace-only text stays admissible: replay visibility must remain
+    // compatible with everything admission has ever accepted, so the
+    // predicate does not trim (#4815 review).
+    assert.throws(() => submit({ text: '' }), isInvalidFrame);
+    assert.doesNotThrow(() => submit({ text: '   ' }));
+  });
+
+  test('admitted structured-only Messages survive queue and steering read-back (#4804)', () => {
+    const admitted = { text: '', quotes: [{ text: 'pasted reference-sized excerpt' }] };
+    // A queued next_turn entry carries content admission already accepted at
+    // submit; the read-back decoders must apply the same rule or the whole
+    // snapshot frame breaks around one admitted entry.
+    const projectionWire = {
+      hostEpoch: 'epoch-1',
+      queueRevision: 7,
+      steering: [],
+      followup: [
+        {
+          ...queuedMessage('later', 'next_turn'),
+          entryId: 'entry-9',
+          messageId: 'm-9',
+          content: admitted,
+        },
+      ],
+    };
+    assert.deepEqual(
+      decodeSessionMessageQueueProjection(JSON.parse(JSON.stringify(projectionWire))),
+      projectionWire,
+    );
+    // The durable steering echo reads back through the session-event frame.
+    assert.doesNotThrow(() =>
+      decodeHostFrame({
+        kind: 'subscription.session_event' as const,
+        hostEpoch: 'epoch-1',
+        subscriptionId: 'subscription-1',
+        sequence: 1,
+        sessionId: 'session-1',
+        runId: 'run-1',
+        event: {
+          type: 'steering_message' as const,
+          id: 'steering-event-9',
+          turnId: 'turn-1',
+          ts: 7,
+          messageId: 'steering-message-9',
+          content: admitted,
+        },
+      }),
+    );
+  });
+
   test('bounds Message text in UTF-8 bytes while preserving frame headroom', () => {
     const input = {
       originHostEpoch: 'epoch-1',
@@ -2135,6 +2248,7 @@ describe('Runtime Host bootstrap protocol', () => {
   });
 
   test('publishes a bounded live Direct peer endpoint through Host status', () => {
+    assert.ok(RUNTIME_HOST_COMPATIBILITY_EPOCH > 94);
     const status = {
       hostEpoch: 'epoch-1',
       compositionId: 'maka.interactive',
@@ -2144,9 +2258,17 @@ describe('Runtime Host bootstrap protocol', () => {
       activeOperations: 0,
       activeResidencies: 0,
       peerEndpoint: {
-        peerId: '12D3KooWhost',
-        routeHints: ['/ip4/192.0.2.1/udp/41000/quic-v1'],
-        coordinationRelays: ['/dns4/relay.example/udp/443/quic-v1/p2p/12D3KooWrelay'],
+        lease: {
+          version: 1,
+          peerId: '12D3KooWhost',
+          revision: 1,
+          issuedAt: 1,
+          expiresAt: 2,
+          directRoutes: ['/ip4/192.0.2.1/udp/41000/quic-v1'],
+          coordinationRoutes: ['/dns4/relay.example/udp/443/quic-v1/p2p/12D3KooWrelay'],
+        },
+        publicKey: 'AA',
+        signature: 'AA',
       },
     };
     assert.deepEqual(HOST_BOOTSTRAP_OPERATION_SPECS['host.status'].decodeOutput(status), status);
@@ -2155,10 +2277,13 @@ describe('Runtime Host bootstrap protocol', () => {
         ...status,
         peerEndpoint: {
           ...status.peerEndpoint,
-          coordinationRelays: [
-            status.peerEndpoint.coordinationRelays[0],
-            status.peerEndpoint.coordinationRelays[0],
-          ],
+          lease: {
+            ...status.peerEndpoint.lease,
+            coordinationRoutes: [
+              status.peerEndpoint.lease.coordinationRoutes[0],
+              status.peerEndpoint.lease.coordinationRoutes[0],
+            ],
+          },
         },
       }),
     );
@@ -2192,6 +2317,7 @@ describe('Runtime Host bootstrap protocol', () => {
         connections: 1,
         activeOperations: 0,
         activeResidencies: 0,
+        upgradeBlockingActivity: true,
         protocolVersion: 0,
         compatibilityEpoch: 9,
         pid: 42,
@@ -2203,6 +2329,44 @@ describe('Runtime Host bootstrap protocol', () => {
         logs,
       }),
     );
+  });
+
+  test('decodes the required upgrade blocking activity fact in diagnostics', () => {
+    const base = {
+      hostEpoch: 'epoch-1',
+      compositionId: 'maka.interactive',
+      compositionRevision: '1',
+      compositionModules: ['interactive'],
+      residencies: [],
+      state: 'ready',
+      connections: 1,
+      activeOperations: 0,
+      activeResidencies: 0,
+      upgradeBlockingActivity: false,
+      protocolVersion: 0,
+      compatibilityEpoch: 9,
+      pid: 42,
+      processUptimeSeconds: 1,
+      nodeVersion: '22.0.0',
+      platform: 'linux',
+      arch: 'x64',
+      osRelease: '6.6.0',
+      logs: [],
+    };
+    const spec = HOST_BOOTSTRAP_OPERATION_SPECS['host.diagnostics.query'];
+
+    assert.deepEqual(spec.decodeOutput(base), { ...base });
+    assert.deepEqual(spec.decodeOutput({ ...base, upgradeBlockingActivity: true }), {
+      ...base,
+      upgradeBlockingActivity: true,
+    });
+    assert.throws(
+      () => spec.decodeOutput({ ...base, upgradeBlockingActivity: 'yes' }),
+      isInvalidFrame,
+    );
+    const missing = { ...base } as Record<string, unknown>;
+    delete missing.upgradeBlockingActivity;
+    assert.throws(() => spec.decodeOutput(missing), isInvalidFrame);
   });
 
   test('rejects terminal snapshots with fields from another terminal variant', () => {
@@ -2318,6 +2482,44 @@ test('Client Capability tool descriptors preserve only known activity kinds', ()
       }),
     isInvalidFrame,
   );
+});
+
+test('Client Capability tuple schemas accept only boolean or schema additionalItems', () => {
+  const input = (additionalItems: unknown) => ({
+    registrationId: 'registration-1',
+    offers: [
+      {
+        offerId: 'desktop_computer_use',
+        version: '0',
+        affinity: 'session',
+        hostPathAccess: 'cwd',
+        label: 'Computer Use',
+        tools: [
+          {
+            serverId: 'desktop_computer_use',
+            name: 'maka_computer',
+            inputSchema: {
+              type: 'object',
+              properties: {
+                position: {
+                  type: 'array',
+                  items: [{ type: 'number' }, { type: 'number' }],
+                  additionalItems,
+                },
+              },
+            },
+          },
+        ],
+      },
+    ],
+  });
+
+  assert.deepEqual(decodeClientCapabilityReplaceInput(input(false)), input(false));
+  assert.deepEqual(
+    decodeClientCapabilityReplaceInput(input({ type: 'number' })),
+    input({ type: 'number' }),
+  );
+  assert.throws(() => decodeClientCapabilityReplaceInput(input('no')), isInvalidFrame);
 });
 
 test('Client Capability progress frames require bounded monotonic coordinates', () => {

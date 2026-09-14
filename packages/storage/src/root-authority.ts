@@ -36,12 +36,12 @@ import { userInfo } from 'node:os';
 import { isAbsolute, join, normalize, parse, resolve } from 'node:path';
 import { tryLock, unlock, waitForLock } from 'fs-native-extensions';
 
-import { ARTIFACT_WRITER_LOCK_FILE } from './artifact-storage-layout.js';
 import { withArtifactWriterBootstrapLock } from './artifact-writer-bootstrap-lock.js';
 import { publishMarkerFile, readBoundedMarkerFile } from './marker-file.js';
 import { syncDirectoryChain } from './stable-storage.js';
 
 export const STORAGE_ROOT_MARKER_FILE = '.maka-storage-root.json';
+export const ARTIFACT_WRITER_LOCK_FILE = '.maka-artifact-writer.lock';
 export const STORAGE_ROOT_MARKER_SCHEMA_VERSION = 1 as const;
 const MAX_STORAGE_ROOT_MARKER_BYTES = 1_024;
 const ARTIFACT_WRITER_BOOTSTRAP_DIRECTORY = 'artifact-writer-bootstrap';

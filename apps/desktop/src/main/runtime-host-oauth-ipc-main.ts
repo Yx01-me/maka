@@ -22,7 +22,8 @@ import {
   decodeRuntimePolicyEntityId,
   type ConnectionCatalogEntry,
 } from '@maka/core/runtime-policy';
-import { isOAuthEnrollmentProviderEnabled } from '@maka/runtime/oauth-provider-contracts';
+import type { SubscriptionActionFailureReason } from '@maka/core/oauth-subscription';
+import { RuntimeHostOperationError } from '@maka/runtime-host/client';
 import {
   OAUTH_LOGIN_PROVIDERS,
   type OAuthConnectionIdentity,
@@ -41,10 +42,12 @@ import {
   handleReconnectableRead,
   type ReconnectableReadIpcMain,
 } from './ipc-reconnect-policy.js';
-import type {
-  OAuthExternalPresentation,
-  OAuthPresentationExpectation,
-  RuntimeHostOAuthPresentation,
+import {
+  OAuthPresentationError,
+  type OAuthExternalPresentation,
+  type OAuthPresentationExpectation,
+  OAuthLoginInProgressError,
+  type RuntimeHostOAuthPresentation,
 } from './runtime-host-oauth-presentation.js';
 
 const OAUTH_POLL_INTERVAL_MS = 250;
@@ -54,19 +57,20 @@ const SHARED_OAUTH_IPC_OPERATIONS = [
   'complete-authorization',
   'cancel-authorization',
   'get-account-state',
+  'get-enrollment-state',
   'refresh-tokens',
   'logout',
 ] as const;
 export const RUNTIME_HOST_OAUTH_IPC_CHANNELS = Object.freeze([
-  ...OAUTH_LOGIN_PROVIDERS.flatMap((provider) => [
-    ...(provider === 'xai-oauth' ? [] : [`${provider}:is-experimental-enabled`]),
-    ...SHARED_OAUTH_IPC_OPERATIONS.map((operation) => `${provider}:${operation}`),
-  ]),
+  ...OAUTH_LOGIN_PROVIDERS.flatMap((provider) =>
+    SHARED_OAUTH_IPC_OPERATIONS.map((operation) => `${provider}:${operation}`),
+  ),
 ]);
 
 type OAuthClient = RuntimeHostAccountConnectionClient & Pick<
   DesktopRuntimeHostClient,
   | 'cancelOAuthLogin'
+  | 'queryOAuthEnrollment'
   | 'queryOAuthLogin'
   | 'startOAuthLogin'
 >;
@@ -76,7 +80,6 @@ export interface RuntimeHostOAuthIpcDeps {
   readonly client: OAuthClient;
   readonly presentation: RuntimeHostOAuthPresentation;
   readonly emitConnectionListChanged: () => void;
-  readonly isProviderEnabled?: (provider: OAuthLoginProvider) => boolean;
 }
 
 interface ActiveOAuthAttempt {
@@ -87,15 +90,10 @@ interface ActiveOAuthAttempt {
 /** Adapts the existing Desktop OAuth UI to the Host's provider-neutral OAuth operations. */
 export function registerRuntimeHostOAuthIpc(deps: RuntimeHostOAuthIpcDeps): void {
   const activeAttempts = new Map<string, ActiveOAuthAttempt>();
-  const providerEnabled = deps.isProviderEnabled ?? isOAuthEnrollmentProviderEnabled;
 
   for (const provider of OAUTH_LOGIN_PROVIDERS) {
     const channel = (operation: string) => `${provider}:${operation}`;
-    if (provider !== 'xai-oauth') {
-      deps.ipcMain.handle(channel('is-experimental-enabled'), () => providerEnabled(provider));
-    }
     deps.ipcMain.handle(channel('get-auth-url'), async (_event, rawTarget: unknown) => {
-      if (!providerEnabled(provider)) return providerDisabled();
       const selection = decodeOAuthLoginSelection(rawTarget);
       if (selection.kind === 'invalid') return invalidConnectionIdentity();
       const connectionId = selection.kind === 'exact' ? selection.connectionId : undefined;
@@ -145,8 +143,15 @@ export function registerRuntimeHostOAuthIpc(deps: RuntimeHostOAuthIpcDeps): void
           error instanceof Error && error.message.trim().length > 0
             ? error.message
             : 'Unable to start OAuth authorization';
-        return actionFailure(detail);
+        return actionFailure(detail, oauthStartFailureReason(error));
       }
+    });
+    handleReconnectableRead(deps.ipcMain, channel('get-enrollment-state'), async () => {
+      // The renderer asks the selected Host whether this provider may enrol, so
+      // it can avoid presenting a primary sign-in that the install refuses.
+      // Desktop keeps no second copy of the Host's gate.
+      const enrollment = await deps.client.queryOAuthEnrollment(provider);
+      return { enabled: enrollment.enabled };
     });
     deps.ipcMain.handle(channel('open-auth-url'), (_event, attemptId: unknown) => {
       return isProviderAttempt(activeAttempts, attemptId, provider)
@@ -432,21 +437,17 @@ async function configuredOAuthAccountConnections(
   return configured.filter(({ status }) => status?.configured).map(({ connection }) => connection);
 }
 
-function providerDisabled() {
-  return actionFailure('OAuth enrollment is disabled for this provider', 'experimental_disabled');
+function actionFailure(message: string, reason: SubscriptionActionFailureReason = 'unknown') {
+  return { ok: false as const, reason, message };
 }
 
-function actionFailure(
-  message: string,
-  reason:
-    | 'authorization_pending'
-    | 'authorization_cancelled'
-    | 'authorization_denied'
-    | 'refresh_failed'
-    | 'experimental_disabled'
-    | 'unknown' = 'unknown',
-) {
-  return { ok: false as const, reason, message };
+function oauthStartFailureReason(error: unknown): SubscriptionActionFailureReason {
+  if (error instanceof OAuthPresentationError) return 'presentation_failed';
+  if (error instanceof OAuthLoginInProgressError) return 'login_in_progress';
+  if (error instanceof RuntimeHostOperationError && error.code === 'operation_unavailable') {
+    return 'experimental_disabled';
+  }
+  return 'unknown';
 }
 
 function delay(ms: number): Promise<void> {

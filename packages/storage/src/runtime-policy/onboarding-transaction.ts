@@ -23,6 +23,7 @@ import {
   decodeProviderType,
   decodeCanonicalConnectionCatalogEntry,
   decodeCredentialVersionBasis,
+  decodeConnectionName,
   decodeConnectionSlug,
   decodeRuntimePolicyEntityId,
   normalizeCatalogConnectionBaseUrl,
@@ -60,6 +61,8 @@ export interface ConnectionOnboardingTransactionInput {
   readonly connectionId: unknown;
   readonly slug: unknown;
   readonly providerType: unknown;
+  /** Optional caller-chosen display name; absent/null keeps the provider default. */
+  readonly name?: unknown;
   readonly suppliedSecret: unknown;
   readonly baseUrl: unknown;
   readonly enabledModelIds: unknown;
@@ -73,6 +76,12 @@ export interface ConnectionOnboardingIntent {
   /** Absent only while replaying a schema-v1 identity-first intent. */
   readonly slug: string | null;
   readonly providerType: ProviderType;
+  /**
+   * Caller-chosen display name pinned into the durable intent; null falls
+   * back to the provider label at upsert. Absent in intents journaled before
+   * this field existed — they decode to null and behave exactly as before.
+   */
+  readonly name: string | null;
   readonly suppliedSecret: string | null;
   readonly baseUrl: string | null;
   readonly enabledModelIds: readonly string[];
@@ -108,13 +117,13 @@ export function prepareConnectionOnboardingIntent(
 ): CurrentConnectionOnboardingIntent {
   const decode = source === 'persisted' ? decodePersistedDomain : decodeConnectionInput;
   const providerType = decode(() => decodeProviderType(input.providerType));
-  if (!providerAuthSupportsApiKey(providerType)) {
+  const definition = PROVIDER_REGISTRY[providerType];
+  if (!providerAuthSupportsApiKey(providerType) && definition.authKind !== 'oauth_token') {
     throw codecError(
       source === 'persisted' ? 'invalid_document' : 'invalid_connection_input',
-      'Onboarding requires an API-key provider',
+      'Onboarding requires a provider with a connection credential',
     );
   }
-  const definition = PROVIDER_REGISTRY[providerType];
   const discovery = decode(() => normalizeConnectionModelDiscoveryResult(input.discovery));
   // Non-empty is the requirement; `source` is write provenance, not a
   // quality bar. A provider without a model-list endpoint runs discovery by
@@ -170,6 +179,10 @@ export function prepareConnectionOnboardingIntent(
     connectionId: decode(() => decodeRuntimePolicyEntityId(input.connectionId)),
     slug: decode(() => decodeConnectionSlug(input.slug)),
     providerType,
+    name:
+      input.name === undefined || input.name === null
+        ? null
+        : decode(() => decodeConnectionName(input.name)),
     suppliedSecret,
     baseUrl,
     enabledModelIds: normalized.enabledModelIds,
@@ -199,6 +212,7 @@ export async function readConnectionOnboardingIntent(
       'connectionId',
       'slug',
       'providerType',
+      'name',
       'suppliedSecret',
       'baseUrl',
       'enabledModelIds',
@@ -220,6 +234,7 @@ export async function readConnectionOnboardingIntent(
       'connectionId',
       'slug',
       'providerType',
+      'name',
       'suppliedSecret',
       'baseUrl',
       'enabledModelIds',
@@ -245,6 +260,7 @@ export async function readConnectionOnboardingIntent(
       connectionId: raw.connectionId,
       slug:
         raw.schemaVersion === 1 ? deriveLegacyIntentPlaceholderSlug(raw.providerType) : raw.slug,
+      name: raw.name,
       suppliedSecret: raw.suppliedSecret,
       baseUrl: raw.baseUrl,
       enabledModelIds: raw.enabledModelIds,
@@ -281,7 +297,7 @@ export function prepareInteractiveOAuthEnrollmentIntent(input: {
     schemaVersion: OAUTH_SCHEMA_VERSION,
     kind: 'oauth_enrollment',
     attemptId: decodeOAuthAttemptId(input.attemptId, 'invalid_connection_input'),
-    target: structuredClone(input.target),
+    target: decodeOAuthTarget(input.target, 'invalid_connection_input'),
     connectionBefore:
       input.connectionBefore === null
         ? null
@@ -322,10 +338,16 @@ function decodeInteractiveOAuthEnrollmentIntent(value: unknown): InteractiveOAut
     raw.credentialBasis === null
       ? null
       : decodePersistedDomain(() => decodeCredentialVersionBasis(raw.credentialBasis));
-  const target = decodeOAuthTarget(raw.target);
+  const target = decodeOAuthTarget(raw.target, 'invalid_document');
   if (
     (target.kind === 'create' && connectionBefore !== null) ||
     (target.kind === 'create' && target.providerType !== connectionAfter.providerType) ||
+    (target.kind === 'create' &&
+      target.slug !== undefined &&
+      target.slug !== connectionAfter.slug) ||
+    (target.kind === 'create' &&
+      target.name !== undefined &&
+      target.name !== connectionAfter.name) ||
     (target.kind === 'existing' &&
       (connectionBefore === null || connectionBefore.connectionId !== target.connectionId)) ||
     connectionAfter.connectionId !==
@@ -349,39 +371,65 @@ function decodeInteractiveOAuthEnrollmentIntent(value: unknown): InteractiveOAut
   };
 }
 
-function decodeOAuthTarget(value: unknown): InteractiveOAuthLoginTarget {
+function decodeOAuthTarget(
+  value: unknown,
+  source: 'invalid_connection_input' | 'invalid_document',
+): InteractiveOAuthLoginTarget {
   const base = record(
     value,
     'OAuth enrollment target',
-    'invalid_document',
-    ['kind', 'providerType', 'connectionId'],
+    source,
+    ['kind', 'providerType', 'connectionId', 'slug', 'name'],
     ['kind'],
   );
   if (base.kind === 'create') {
-    const item = record(value, 'OAuth create target', 'invalid_document', ['kind', 'providerType']);
-    const providerType = decodePersistedDomain(() => decodeProviderType(item.providerType));
+    const item = record(
+      value,
+      'OAuth create target',
+      source,
+      ['kind', 'providerType', 'slug', 'name'],
+      ['kind', 'providerType'],
+    );
+    const decode = source === 'invalid_document' ? decodePersistedDomain : decodeConnectionInput;
+    const providerType = decode(() => decodeProviderType(item.providerType));
     if (!isOAuthProvider(providerType)) {
-      throw codecError('invalid_document', 'OAuth create target provider is invalid');
+      throw codecError(source, 'OAuth create target provider is invalid');
     }
-    return { kind: 'create', providerType };
-  }
-  if (base.kind === 'existing') {
-    const item = record(value, 'OAuth existing target', 'invalid_document', [
-      'kind',
-      'connectionId',
-    ]);
+    if (providerType !== 'openai-codex' && (item.slug !== undefined || item.name !== undefined)) {
+      throw codecError(
+        source,
+        'Custom OAuth Connection identity is only supported for openai-codex',
+      );
+    }
+    if (providerType !== 'openai-codex') return { kind: 'create', providerType };
     return {
-      kind: 'existing',
-      connectionId: decodePersistedDomain(() => decodeRuntimePolicyEntityId(item.connectionId)),
+      kind: 'create',
+      providerType,
+      ...(item.slug === undefined ? {} : { slug: decode(() => decodeConnectionSlug(item.slug)) }),
+      ...(item.name === undefined ? {} : { name: decode(() => decodeConnectionName(item.name)) }),
     };
   }
-  throw codecError('invalid_document', 'OAuth enrollment target kind is invalid');
+  if (base.kind === 'existing') {
+    const item = record(value, 'OAuth existing target', source, ['kind', 'connectionId']);
+    return {
+      kind: 'existing',
+      connectionId:
+        source === 'invalid_document'
+          ? decodePersistedDomain(() => decodeRuntimePolicyEntityId(item.connectionId))
+          : decodeConnectionInput(() => decodeRuntimePolicyEntityId(item.connectionId)),
+    };
+  }
+  throw codecError(source, 'OAuth enrollment target kind is invalid');
 }
 
 function isOAuthProvider(
   providerType: ProviderType,
 ): providerType is InteractiveOAuthLoginProvider {
-  return providerType === 'openai-codex' || providerType === 'xai-oauth';
+  return (
+    providerType === 'openai-codex' ||
+    providerType === 'xai-oauth' ||
+    providerType === 'github-copilot'
+  );
 }
 
 function decodeOAuthAttemptId(

@@ -115,6 +115,8 @@ function resolveBase(event: SessionEvent, ctx: RuntimeEventMapContext) {
  *   - sandbox_boundary_request     → role 'system',  author 'system'
  *   - sandbox_boundary_decision_ack → role 'system', author 'user'
  *   - user_question_answer_ack     → role 'system',  author 'user'
+ *   - form_request                 → role 'system',  author 'system'
+ *   - form_answer_ack              → role 'system',  author 'user'
  *   - plan_submitted               → role 'system',  author 'agent'
  *   - token_usage                  → role 'system',  author 'system'
  *   - error                        → role 'system',  author 'system'
@@ -133,6 +135,9 @@ export function mapSessionEventToRuntimeEvent(
   if (isHostProjectionSessionEvent(event)) {
     // These are Host/kernel projection facts, not backend events. The live
     // ingress drops them, so reaching this line bypassed that authority boundary.
+    // `context_compaction_started` is one of these: synthesized by the Runtime
+    // Host session projector for the renderer's live "compacting" row, never
+    // produced by a backend or the kernel.
     throw new Error(`${event.type} is not a backend event`);
   }
   if (isLegacyPermissionSessionEvent(event)) {
@@ -152,6 +157,7 @@ function isHostProjectionSessionEvent(event: SessionEvent): event is Extract<
     type:
       | 'queue_update'
       | 'message_admission'
+      | 'context_compaction_started'
       | 'client_capability_request'
       | 'client_capability_decision_ack';
   }
@@ -159,6 +165,7 @@ function isHostProjectionSessionEvent(event: SessionEvent): event is Extract<
   return (
     event.type === 'queue_update' ||
     event.type === 'message_admission' ||
+    event.type === 'context_compaction_started' ||
     event.type === 'client_capability_request' ||
     event.type === 'client_capability_decision_ack'
   );
@@ -203,11 +210,13 @@ function mapBackendSessionEvent(
     case 'text_complete':
       return {
         ...base,
+        ...(event.interrupted ? { modelVisibility: 'hidden' as const } : {}),
         role: 'model',
         author: 'agent',
         content: {
           kind: 'text',
           text: event.text,
+          ...(event.interrupted ? { interrupted: true } : {}),
           ...(event.providerOptions !== undefined
             ? { providerOptions: structuredClone(event.providerOptions) }
             : {}),
@@ -228,6 +237,7 @@ function mapBackendSessionEvent(
     case 'thinking_complete':
       return {
         ...base,
+        ...(event.interrupted ? { modelVisibility: 'hidden' as const } : {}),
         role: 'model',
         author: 'agent',
         content: {
@@ -453,6 +463,30 @@ function mapBackendSessionEvent(
         },
         refs: { toolCallId: event.toolUseId },
       };
+    case 'form_request':
+      return {
+        ...base,
+        role: 'system',
+        author: 'system',
+        actions: {
+          formRequest: {
+            requestId: event.requestId,
+            toolUseId: event.toolUseId,
+            message: event.message,
+            requester: event.requester,
+            fields: event.fields,
+          },
+        },
+        refs: { toolCallId: event.toolUseId },
+      };
+    case 'form_answer_ack':
+      return {
+        ...base,
+        role: 'system',
+        author: 'user',
+        actions: { formAnswerAccepted: { requestId: event.requestId } },
+        refs: { toolCallId: event.toolUseId },
+      };
 
     // ── Steering: a user message injected mid-turn at a step boundary ─────
     // Persisted as a first-class user event so the ledger, transcript, and
@@ -585,6 +619,7 @@ function mapBackendSessionEvent(
         ...(event.reason !== undefined ? { reason: event.reason } : {}),
         message: event.message,
         ...(event.details !== undefined ? { details: event.details } : {}),
+        ...(event.retry !== undefined ? { retry: event.retry } : {}),
       };
       memory.failureContent = content;
       return {

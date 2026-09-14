@@ -29,13 +29,14 @@ import { BrowserViewManager } from './browser/view-manager.js';
 import type { E2eFixture } from './e2e-fixture.js';
 import { installMainWindowPermissionPolicy } from './main-window-permission-policy.js';
 import { loadMainRenderer, resolveMainRendererEntry } from './main-renderer-loader.js';
+import { clearDevRendererHttpCache } from './main-renderer-dev-cache.js';
 import {
   type MainRendererFrameIdentity,
   observeMainRendererProcessGone,
   reloadMainRendererProcess,
 } from './main-renderer-process-gone.js';
 import { isDarkAppearance, isThemePreference, toNativeThemeSource } from './theme-source.js';
-import { createWindowRevealGate } from './window-reveal.js';
+import { createWindowRevealGate, type WindowRevealMode } from './window-reveal.js';
 import { createWindowsMaximizeRendererSync } from './windows-maximize-renderer-sync.js';
 import {
   parseDesktopSessionResourceKey,
@@ -53,6 +54,9 @@ export interface MainWindowController {
    */
   reloadMainRenderer(): Promise<boolean>;
   send(channel: string, ...args: unknown[]): void;
+  /** Subscribe an app-owned renderer to existing application broadcasts. */
+  registerAuxiliaryRenderer(contents: Electron.WebContents): () => void;
+  ownsRenderer(contents: Electron.WebContents): boolean;
   // PR-SHOW-AFTER-FIRST-COMMIT: reveal the hidden window after the renderer's
   // first React commit. Idempotent + e2e-fixture-safe (see notifyRendererReady).
   notifyRendererReady(
@@ -97,31 +101,41 @@ interface MainWindowControllerDeps {
   settingsStore: SettingsReader;
   // main.ts computes this from the same isE2e gate that also guards userData
   // and the fake backend, so main-window.ts owns no env policy of its own.
-  startHidden: boolean;
+  revealMode: WindowRevealMode;
   onClose?: () => void;
+  onClosed?: () => void;
+  onShow?: () => void;
   onRendererProcessGone: (details: Electron.RenderProcessGoneDetails) => void | Promise<void>;
 }
 
 let mainWindow: BrowserWindow | null = null;
+const auxiliaryRenderers = new Set<Electron.WebContents>();
+
+function registerAuxiliaryRenderer(contents: Electron.WebContents): () => void {
+  if (contents.isDestroyed()) return () => undefined;
+  auxiliaryRenderers.add(contents);
+  const release = () => {
+    auxiliaryRenderers.delete(contents);
+    contents.removeListener('destroyed', release);
+  };
+  contents.once('destroyed', release);
+  return release;
+}
+
+function ownsRenderer(contents: Electron.WebContents): boolean {
+  if (contents.isDestroyed()) return false;
+  return (!!mainWindow && !mainWindow.isDestroyed() && contents === mainWindow.webContents)
+    || auxiliaryRenderers.has(contents);
+}
 let browserViews: BrowserViewManager<BrowserViewController> | undefined;
 
-/**
- * Guarded `webContents.send` for `mainWindow`. The `mainWindow?.` optional
- * chain only covers a null reference — it does NOT catch the case where the
- * BrowserWindow has been destroyed (window closed, renderer crashed,
- * teardown raced) while the variable still points at the freed object.
- * Calling `.webContents.send` in that state throws `TypeError: Object has
- * been destroyed`, surfacing as a main-process JS-error dialog.
- *
- * Use this helper anywhere a timer / IPC / menu accelerator might race
- * window teardown. No-op when the window is gone — callers that need
- * delivery confirmation should observe their own state.
- */
+/** Broadcast existing app events once to each live owned renderer, even if the main window is closed. */
 export function safeSendToRenderer(channel: string, ...args: unknown[]): void {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  const wc = mainWindow.webContents;
-  if (wc.isDestroyed()) return;
-  wc.send(channel, ...args);
+  const recipients = new Set(auxiliaryRenderers);
+  if (mainWindow && !mainWindow.isDestroyed()) recipients.add(mainWindow.webContents);
+  for (const contents of recipients) {
+    if (!contents.isDestroyed()) contents.send(channel, ...args);
+  }
 }
 
 // The close button's centre sits on the same vertical line as the sidebar's
@@ -165,22 +179,21 @@ const titleBarOverlayOptions = (
 });
 
 export function createMainWindowController(deps: MainWindowControllerDeps): MainWindowController {
-  const { workspaceRoot, e2eFixture, settingsStore, startHidden } = deps;
+  const { workspaceRoot, e2eFixture, settingsStore } = deps;
   const liveBrowserScopes = new Map<string, { hostId: string; targetEpoch: string }>();
 
-  // PR-SHOW-AFTER-FIRST-COMMIT: windows launched hidden (startHidden covers
+  // PR-SHOW-AFTER-FIRST-COMMIT: windows launched hidden (`hidden` covers
   // e2e-fixture capture and E2E — see main.ts) must never be revealed;
   // e2e-fixture captures run on the hidden window and E2E drives it headless.
-  // `!app.isPackaged` mirrors the original creation-time gate so a packaged
-  // build ignores a stray startHidden flag. The fallback timer, the
-  // renderer-ready IPC, and focus() all route their show() through this
-  // predicate via the reveal gate below.
-  const keepHiddenForE2eFixture = !app.isPackaged && startHidden;
+  // A run that asked for a visible window is `inactive`: it reveals, but never
+  // activates the app. The fallback timer, the renderer-ready IPC, and focus()
+  // all route their show() through this mode via the reveal gate below.
+  const revealMode: WindowRevealMode = deps.revealMode;
   // ChatGPT Pro review P2: focus() (second-instance / activate) used to call
   // mainWindow.show() directly, bypassing the reveal gate — re-launching or
   // clicking the dock icon during the pre-commit window would flash the
   // skeleton anyway. The gate defers those focus requests until markReady.
-  const revealGate = createWindowRevealGate(keepHiddenForE2eFixture);
+  const revealGate = createWindowRevealGate(revealMode);
   let showFallbackTimer: NodeJS.Timeout | undefined;
   let rendererRecoveryReadiness:
     | {
@@ -197,7 +210,7 @@ export function createMainWindowController(deps: MainWindowControllerDeps): Main
   };
   const armShowFallbackTimer = (target: BrowserWindow): void => {
     clearShowFallbackTimer();
-    if (keepHiddenForE2eFixture || target.isDestroyed() || target.isVisible()) return;
+    if (revealMode === 'hidden' || target.isDestroyed() || target.isVisible()) return;
     showFallbackTimer = setTimeout(() => {
       showFallbackTimer = undefined;
       if (!target.isDestroyed()) revealGate.markReady(target);
@@ -436,6 +449,7 @@ export function createMainWindowController(deps: MainWindowControllerDeps): Main
     //
     // Both are gated on the URL using `http(s):` or `mailto:` — everything else
     // (file://, electron internal, etc.) is allowed/denied per Electron defaults.
+    mainWindow.once('show', () => deps.onShow?.());
     mainWindow.webContents.setWindowOpenHandler(({ url }) => {
       if (isExternalUrl(url)) {
         void shell.openExternal(url);
@@ -468,6 +482,8 @@ export function createMainWindowController(deps: MainWindowControllerDeps): Main
           const block = (e) => {
             const target = e.target instanceof Element ? e.target : e.target?.parentElement;
             if (target?.closest('[data-maka-file-drop-target="true"]')) return;
+            if (target?.closest('[data-maka-queue-drop-target="true"]')
+              && e.dataTransfer?.types.includes('application/x-maka-queue-entry')) return;
             e.preventDefault();
             e.stopPropagation();
           };
@@ -522,6 +538,12 @@ export function createMainWindowController(deps: MainWindowControllerDeps): Main
         : { ...mainWindow.getBounds(), isMaximized: false };
       void writeSavedBounds(workspaceRoot, final);
     });
+    mainWindow.once('closed', () => deps.onClosed?.());
+
+    // Dev-server cache hygiene (issue #4775) — see main-renderer-dev-cache.ts
+    // for why a stale immutable dep-chunk graph must never survive into a new
+    // dev session (duplicate React instances → null hook dispatcher crash).
+    await clearDevRendererHttpCache(mainWindow.webContents.session, rendererEntry);
 
     await loadMainRenderer(mainWindow, rendererEntry);
 
@@ -604,6 +626,8 @@ export function createMainWindowController(deps: MainWindowControllerDeps): Main
       }
     },
     send: safeSendToRenderer,
+    registerAuxiliaryRenderer,
+    ownsRenderer,
     notifyRendererReady(sender, senderFrame) {
       if (!mainWindow || mainWindow.isDestroyed() || sender !== mainWindow.webContents) return;
       const recovery = rendererRecoveryReadiness;
