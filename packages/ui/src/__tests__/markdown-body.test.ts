@@ -162,6 +162,33 @@ it('renders display math while leaving ordinary currency alone', () => {
   assert.doesNotMatch(markup, /class="maka-math maka-math-inline"/);
 });
 
+it('keeps escaped brackets literal inside Markdown link labels', () => {
+  const markup = renderToStaticMarkup(createElement(LocaleProvider, {
+    locale: 'en',
+    children: createElement(MarkdownBody, {
+      text: '[\\[DISCUSS\\] Clarify](https://example.com)',
+    }),
+  }));
+
+  assert.match(markup, /<a\b[^>]*href="https:\/\/example\.com"/);
+  assert.match(markup, /\[DISCUSS\] Clarify/);
+  assert.doesNotMatch(markup, /class="maka-math/);
+  assert.doesNotMatch(markup, /class="katex/);
+});
+
+it('still renders explicit inline math inside Markdown link labels', () => {
+  const markup = renderToStaticMarkup(createElement(LocaleProvider, {
+    locale: 'en',
+    children: createElement(MarkdownBody, {
+      text: '[Value \\(x + 1\\)](https://example.com)',
+    }),
+  }));
+
+  assert.match(markup, /<a\b[^>]*href="https:\/\/example\.com"/);
+  assert.match(markup, /class="maka-math maka-math-inline"/);
+  assert.match(markup, /class="katex"/);
+});
+
 it('does not treat shell variables, currency, or inline code as dollar-delimited math', () => {
   const markup = renderToStaticMarkup(createElement(MarkdownBody, {
     text: [

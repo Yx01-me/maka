@@ -90,7 +90,12 @@ export const MARKDOWN_MATH_PLUGINS = [{
   },
 }] satisfies MarkdownInlinePlugin[];
 
-function protectMarkdownMath(source: string, startsAtLineStart = true): {
+function protectMarkdownMath(
+  source: string,
+  startsAtLineStart = true,
+  protectEscapedBrackets = false,
+  detectLinkLabels = true,
+): {
   text: string;
   safeSourceEnd: number;
   safeTextEnd: number;
@@ -119,6 +124,38 @@ function protectMarkdownMath(source: string, startsAtLineStart = true): {
       atLineStart = source[index - 1] === '\n';
       if (fence.closed) markSafe();
       else break;
+      continue;
+    }
+
+    // Hide escaped label brackets from both the math delimiter scan and the
+    // Markdown bracket matcher, then restore them through the literal plugin.
+    if (
+      protectEscapedBrackets
+      && source[index] === '\\'
+      && (source[index + 1] === '[' || source[index + 1] === ']')
+    ) {
+      text += transportToken(source[index + 1] ?? '', '2');
+      index += 2;
+      atLineStart = false;
+      markSafe();
+      continue;
+    }
+
+    const linkLabel = detectLinkLabels
+      ? readMarkdownLinkLabel(source, index)
+      : undefined;
+    if (linkLabel?.kind === 'pending') {
+      text += source.slice(index);
+      break;
+    }
+    if (linkLabel?.kind === 'match') {
+      const labelSource = source.slice(index + 1, linkLabel.end - 1);
+      const protectedLabel = protectMarkdownMath(labelSource, false, true, false);
+      text += `[${protectedLabel.text}]`;
+      index = linkLabel.end;
+      atLineStart = false;
+      if (protectedLabel.safeSourceEnd === labelSource.length) markSafe();
+      else canMarkSafe = false;
       continue;
     }
 
@@ -187,6 +224,49 @@ function protectMarkdownMath(source: string, startsAtLineStart = true): {
   }
 
   return { text, safeSourceEnd, safeTextEnd };
+}
+
+function readMarkdownLinkLabel(
+  source: string,
+  index: number,
+):
+  | { kind: 'match'; end: number }
+  | { kind: 'pending' }
+  | undefined {
+  if (source[index] !== '[') return undefined;
+
+  let depth = 1;
+  let cursor = index + 1;
+  while (cursor < source.length) {
+    if (source[cursor] === '\\') {
+      cursor += Math.min(2, source.length - cursor);
+      continue;
+    }
+    if (source[cursor] === '`') {
+      let runEnd = cursor + 1;
+      while (source[runEnd] === '`') runEnd++;
+      const run = source.slice(cursor, runEnd);
+      const close = source.indexOf(run, runEnd);
+      if (close < 0) return { kind: 'pending' };
+      cursor = close + run.length;
+      continue;
+    }
+    if (source[cursor] === '[') {
+      depth++;
+      cursor++;
+      continue;
+    }
+    if (source[cursor] === ']') {
+      depth--;
+      cursor++;
+      if (depth > 0) continue;
+      return source[cursor] === '(' || source[cursor] === '['
+        ? { kind: 'match', end: cursor }
+        : undefined;
+    }
+    cursor++;
+  }
+  return { kind: 'pending' };
 }
 
 function readFence(
