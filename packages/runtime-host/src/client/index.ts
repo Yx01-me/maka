@@ -122,6 +122,8 @@ export {
 } from './remote-compatibility-error.js';
 export {
   RuntimeHostSubscriptionError,
+  SessionRemovedSubscriptionError,
+  subscriptionClosedError,
   type DecodedSessionTranscriptPage,
   type RuntimeHostSessionSubscription,
 } from './session-subscription.js';
@@ -154,6 +156,7 @@ export {
   type RuntimeHostConnectionCatalogSnapshot,
 } from './catalog-reader.js';
 export {
+  IDLE_GRACE_MS_ENV_VAR,
   connectOrSpawnRuntimeHost,
   type CandidateExitDetails,
   type ConnectOrSpawnRuntimeHostInput,

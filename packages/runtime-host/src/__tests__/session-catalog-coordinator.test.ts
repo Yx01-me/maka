@@ -63,6 +63,7 @@ import {
   HostSessionCatalogCoordinator,
   NoUsableImportModelError,
   SessionOperationFailure,
+  WorkHubDefaultModelRequiredError,
   type HostSessionCatalogCoordinatorOptions,
 } from '../server/session-catalog-coordinator.js';
 import { SessionAdmissionGate } from '../server/session-admission-gate.js';
@@ -165,6 +166,7 @@ test('read marker clears unread only at the ledger transcript tail', async () =>
         records: [
           {
             sequence: 1,
+            cluster: 1,
             message: {
               type: 'assistant',
               id: 'message-2',
@@ -176,6 +178,7 @@ test('read marker clears unread only at the ledger transcript tail', async () =>
           },
           {
             sequence: 0,
+            cluster: 1,
             message: { type: 'user', id: 'message-1', turnId: 'turn-1', ts: 10, text: 'ask' },
           },
         ],
@@ -211,6 +214,7 @@ test('read marker pages past a hidden tail to reach the newest visible message',
     records: [
       {
         sequence: 2,
+        cluster: 1,
         message: {
           type: 'turn_state' as const,
           id: 'turn-state-1',
@@ -227,6 +231,7 @@ test('read marker pages past a hidden tail to reach the newest visible message',
     records: [
       {
         sequence: 1,
+        cluster: 1,
         message: {
           type: 'assistant' as const,
           id: 'message-2',
@@ -629,6 +634,7 @@ test('WorkHub model authority preserves its execution policy and uses versioned 
   });
   const input = {
     expectedRevision: fixture.revision(),
+    thinkingLevel: null,
     modelTarget: {
       kind: 'explicit' as const,
       connectionId: 'connection-1',
@@ -648,6 +654,43 @@ test('WorkHub model authority preserves its execution policy and uses versioned 
   const rejected = await corrupt.coordinator.configureWorkHubModel(input);
   assert.equal(rejected.ok, false);
   assert.equal(corrupt.revision(), 3);
+});
+
+test('WorkHub thinking level persists, clears to default and rejects unsupported levels', async () => {
+  const fixture = createFixture({
+    header: {
+      id: WORKHUB_COORDINATION_SESSION_ID,
+      role: WORKHUB_COORDINATION_SESSION_ROLE,
+      toolProfile: 'workhub-coordination-v2',
+      permissionMode: 'bypass',
+    },
+    connection: {
+      providerType: 'openai-compatible',
+      modelOverrides: { 'model-1': { thinkingLevels: ['low', 'high'] } },
+    },
+  });
+  const modelTarget = {
+    kind: 'explicit' as const,
+    connectionId: 'connection-1',
+    connectionSlug: 'test',
+    model: 'model-1',
+  };
+  const set = (thinkingLevel: 'low' | 'high' | 'xhigh' | null) =>
+    fixture.coordinator.configureWorkHubModel({
+      expectedRevision: fixture.revision(),
+      modelTarget,
+      thinkingLevel,
+    });
+  assert.equal((await set('high')).ok, true);
+  assert.equal(fixture.header().thinkingLevel, 'high');
+  const revision = fixture.revision();
+  assert.equal((await set('xhigh')).ok, false);
+  assert.equal(fixture.revision(), revision);
+  assert.equal(fixture.header().thinkingLevel, 'high');
+  assert.equal((await set(null)).ok, true);
+  assert.equal(fixture.header().thinkingLevel, undefined);
+  assert.equal(fixture.header().permissionMode, 'bypass');
+  assert.equal(fixture.header().toolProfile, 'workhub-coordination-v2');
 });
 
 test('ordinary metadata and configuration reject a corrupt Coordination role on another identity', async () => {
@@ -745,6 +788,93 @@ test('creation on a relay connection honours declared levels via the catalog pro
   assert.equal(createAttempts, 1);
   assert.equal(persistedThinkingLevel, 'low');
   assert.equal(persistedConnectionId, 'connection-1');
+});
+
+test("creation applies the selected model's configured thinking default", async () => {
+  let persistedThinkingLevel: unknown;
+  const fixture = createFixture({
+    connection: {
+      providerType: 'openai-compatible',
+      enabledModelIds: ['relay-model'],
+      models: [{ id: 'relay-model' }],
+      modelOverrides: {
+        'relay-model': {
+          thinkingLevels: ['low', 'high'],
+          defaultThinkingLevel: 'high',
+        },
+      },
+    },
+    stores: {
+      createStableSession: async (args) => {
+        persistedThinkingLevel = args.input.thinkingLevel;
+        return {
+          kind: 'existing' as const,
+          record: headerSnapshot(sessionHeader(args.sessionId, ['user-label']), 1),
+        };
+      },
+    },
+  });
+
+  const outcome = await fixture.coordinator.handlers['session.create'](
+    {
+      sessionId: fixture.sessionId,
+      workspace: { kind: 'host_path', path: process.cwd() },
+      modelTarget: {
+        kind: 'explicit',
+        connectionId: 'connection-1',
+        connectionSlug: 'test',
+        model: 'relay-model',
+      },
+    },
+    context,
+  );
+
+  assert.equal(outcome.ok, true);
+  assert.equal(persistedThinkingLevel, 'high');
+});
+
+test('creation can explicitly bypass a configured model thinking default', async () => {
+  let persistedThinkingLevel: unknown = 'not-called';
+  const fixture = createFixture({
+    connection: {
+      providerType: 'openai-compatible',
+      enabledModelIds: ['relay-model'],
+      models: [{ id: 'relay-model' }],
+      modelOverrides: {
+        'relay-model': {
+          thinkingLevels: ['low', 'high'],
+          defaultThinkingLevel: 'high',
+        },
+      },
+    },
+    stores: {
+      createStableSession: async (args) => {
+        persistedThinkingLevel = args.input.thinkingLevel;
+        return {
+          kind: 'existing' as const,
+          record: headerSnapshot(sessionHeader(args.sessionId, ['user-label']), 1),
+        };
+      },
+    },
+  });
+
+  const outcome = await fixture.coordinator.handlers['session.create'](
+    {
+      sessionId: fixture.sessionId,
+      workspace: { kind: 'host_path', path: process.cwd() },
+      modelTarget: {
+        kind: 'explicit',
+        connectionId: 'connection-1',
+        connectionSlug: 'test',
+        model: 'relay-model',
+      },
+      thinkingLevel: null,
+    },
+    context,
+  );
+
+  assert.equal(outcome.ok, true);
+  assert.equal(persistedThinkingLevel, undefined);
 });
 
 test('plugin executor creation bypasses model resolution and persists the executor route', async () => {
@@ -1953,7 +2083,7 @@ test('autonomous create target fails closed when no default is set, even with a 
   await assert.rejects(
     fixture.coordinator.resolveDefaultCreateTarget(),
     (error: unknown) =>
-      error instanceof SessionOperationFailure &&
+      error instanceof WorkHubDefaultModelRequiredError &&
       error.code === 'operation_unavailable' &&
       /No default Session model is configured/i.test(error.message),
   );
