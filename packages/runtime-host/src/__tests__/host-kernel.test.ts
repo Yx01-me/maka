@@ -3791,6 +3791,8 @@ describe('non-serving Runtime Host kernel', () => {
       const registration = await readHostRegistration(controlDirectory);
       assert.ok(registration);
       await candidate.host.close();
+      const recreated = await prepareStorageRootControlDirectory(capability);
+      assert.equal(recreated.controlDirectory, controlDirectory);
       await writeHostRegistration(controlDirectory, registration);
 
       const connection = await connectRuntimeHost({
