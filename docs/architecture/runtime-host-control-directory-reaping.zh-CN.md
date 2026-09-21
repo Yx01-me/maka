@@ -113,10 +113,12 @@ validate <rootId> direct child
   -> exclusively lock .maka-artifact-writer.lock without waiting
   -> revalidate directory dev/ino
   -> confirm every top-level entry is disposable
+  -> capture directory mtime after the reaper's own lock-file creation
   -> revalidate both lock handle/path identities
   -> mkdir runtime-hosts/.reap/<claimUuid>
   -> exclusively lock claim/.claim.lock
   -> revalidate source directory, both locks and disposable entries again
+  -> if directory mtime changed during claim allocation and is inside grace, skip
   -> rename <rootId> to .reap/<claimUuid>/<rootId>
   -> release and close acquired locks
   -> stream deletion of <claimUuid> while holding claim lock
@@ -130,6 +132,7 @@ validate <rootId> direct child
 - 目录在获取锁前后的 `dev/ino` 必须相同；
 - 两个锁都必须是 handle 与当前路径指向同一 `dev/ino` 的普通文件；
 - 缺失的锁文件允许以私有权限创建，然后立即尝试非阻塞排他锁；
+- claim 分配期间若目录 mtime 被其他活动刷新且重新落入 grace，放弃本次 quarantine；基线在 reaper 创建锁文件后采集，避免把自身写入误判成 Host 活动；
 - 任何未知顶层文件或目录都使本轮跳过，不会进入 claim 删除；
 - claim 使用 UUID v4；`mkdir` 遇到 `EEXIST` 时重新生成，最多尝试 3 次。
 
@@ -250,7 +253,7 @@ shared Root Reader 的 `close()` 只释放 reader lock，不主动回收目录�
 | 目录含访问凭据、插件数据或未知条目 | 跳过整目录 quarantine，目录及其内容保留 |
 | 两个跨进程 reaper 处理同一目录 | 最多一个取得双锁并 rename；另一个得到 contention、identity 变化或 `ENOENT` |
 | rename 后新 Host 重建 `<rootId>` | 新 Host 使用新目录；旧 reaper 只删除 claim |
-| 竞争者已打开旧 inode | 竞争者的 stable-path 校验发现路径 identity 改变并拒绝继续 |
+| 启动方已打开旧 `owner.lock` inode | stable-path 校验发现 identity 改变；启动方在仍持有 durable owner lock 时重建目录并重试一次 compatibility lock |
 | reaper 在 rename 后、rm 前崩溃 | 原路径可立即重用；旧 claim 在后续轮次超过 grace 后删除 |
 
 Reaper 不通过 PID、heartbeat 或目录 mtime 判断进程是否存活。mtime 只承担 grace period；双锁才是在线使用证明。

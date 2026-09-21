@@ -929,6 +929,108 @@ describe('storage root authority', () => {
     });
   });
 
+  test('retries owner acquisition when a reaper renames the opened control directory', {
+    skip: process.platform === 'win32',
+  }, async (context) => {
+    await withRoots(async ({ root }) => {
+      const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
+      const { controlDirectory } = await prepareStorageRootControlDirectory(capability);
+      await writeFile(join(controlDirectory, 'registration.json'), '{}\n');
+
+      const ownerLockPath = join(controlDirectory, 'owner.lock');
+      const originalOpen = filesystem.open;
+      let openedOwnerLock!: () => void;
+      const ownerLockOpened = new Promise<void>((resolve) => {
+        openedOwnerLock = resolve;
+      });
+      let resumeOwnerAcquisition!: () => void;
+      const ownerAcquisitionBlocked = new Promise<void>((resolve) => {
+        resumeOwnerAcquisition = resolve;
+      });
+      let paused = false;
+      context.mock.method(
+        filesystem,
+        'open',
+        async (...args: Parameters<typeof filesystem.open>) => {
+          const handle = await originalOpen(...args);
+          if (String(args[0]) === ownerLockPath && !paused) {
+            paused = true;
+            openedOwnerLock();
+            await ownerAcquisitionBlocked;
+          }
+          return handle;
+        },
+      );
+      syncBuiltinESMExports();
+
+      let owner: Awaited<ReturnType<typeof tryAcquireInteractiveRootOwner>>;
+      try {
+        const acquiringOwner = tryAcquireInteractiveRootOwner(capability);
+        await ownerLockOpened;
+        const summary = await reapStaleRootControlDirectories({
+          graceMs: 0,
+          maxEntries: 100_000,
+        });
+        assert.equal(summary.reaped, 1);
+        resumeOwnerAcquisition();
+        owner = await acquiringOwner;
+        assert.ok(owner);
+        assert.equal((await lstat(owner.controlDirectory)).isDirectory(), true);
+      } finally {
+        resumeOwnerAcquisition();
+        context.mock.restoreAll();
+        syncBuiltinESMExports();
+        await owner?.close();
+      }
+    });
+  });
+
+  test('rechecks directory freshness immediately before quarantine rename', {
+    skip: process.platform === 'win32',
+  }, async (context) => {
+    await withRoots(async ({ root }) => {
+      const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
+      const { controlDirectory } = await prepareStorageRootControlDirectory(capability);
+      await writeFile(join(controlDirectory, 'owner.lock'), '');
+      await writeFile(join(controlDirectory, '.maka-artifact-writer.lock'), '');
+      await writeFile(join(controlDirectory, 'registration.json'), '{}\n');
+      const staleTime = new Date(Date.now() - 120_000);
+      await utimes(controlDirectory, staleTime, staleTime);
+
+      const originalMkdir = filesystem.mkdir;
+      let refreshed = false;
+      context.mock.method(
+        filesystem,
+        'mkdir',
+        async (...args: Parameters<typeof filesystem.mkdir>) => {
+          const result = await originalMkdir(...args);
+          if (String(args[0]).includes('.reap/') && !refreshed) {
+            refreshed = true;
+            await writeFile(
+              join(controlDirectory, `registration.json.${process.pid}.${randomUUID()}.tmp`),
+              '{}\n',
+            );
+          }
+          return result;
+        },
+      );
+      syncBuiltinESMExports();
+      try {
+        const summary = await reapStaleRootControlDirectories({
+          graceMs: 60_000,
+          maxEntries: 100_000,
+        });
+        assert.equal(refreshed, true);
+        assert.equal(summary.reaped, 0);
+        assert.ok(summary.skipped >= 1);
+        assert.equal((await lstat(controlDirectory)).isDirectory(), true);
+      } finally {
+        context.mock.restoreAll();
+        syncBuiltinESMExports();
+      }
+    });
+  });
+
   test('releases owner locks even when normal control-directory cleanup fails', async () => {
     await withRoots(async ({ root }) => {
       const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });

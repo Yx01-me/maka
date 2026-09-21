@@ -771,6 +771,7 @@ async function* rootControlReapEvents(
           controlRoot,
           rootId: entry.name,
           expectedDirectoryIdentity: metadata,
+          minimumDirectoryAgeMs: graceMs,
         });
         if (result.kind === 'quarantined') {
           yield* removeRootControlClaim(controlRoot, result.claimDirectory, result.claimHandle);
@@ -1025,11 +1026,27 @@ async function acquireStateRootLock<K extends StorageRootKind>(
   let compatibilityHandle: FileHandle | undefined;
   let controlDirectory: string;
   try {
-    ({ controlDirectory } = await prepareStorageRootControlDirectory(capability));
-    compatibilityHandle = await tryAcquireStableRootLock(
-      join(controlDirectory, 'owner.lock'),
-      access,
-    );
+    for (let attempt = 0; ; attempt += 1) {
+      ({ controlDirectory } = await prepareStorageRootControlDirectory(capability));
+      try {
+        compatibilityHandle = await tryAcquireStableRootLock(
+          join(controlDirectory, 'owner.lock'),
+          access,
+        );
+        break;
+      } catch (error) {
+        // A stale-directory reaper can rename the compatibility lock after it
+        // is opened but before its identity is checked. The durable lock held
+        // above makes one retry safe and prevents two owners from emerging.
+        if (
+          attempt !== 0 ||
+          !(error instanceof StorageRootAuthorityError) ||
+          error.code !== 'invalid_lock_artifact'
+        ) {
+          throw error;
+        }
+      }
+    }
     if (!compatibilityHandle) {
       releaseLock(durableHandle);
       await durableHandle.close();
@@ -1165,6 +1182,7 @@ interface QuarantineRootControlDirectoryInput {
   controlRoot: string;
   rootId: string;
   expectedDirectoryIdentity?: BigIntStats;
+  minimumDirectoryAgeMs?: number;
   heldOwnerHandle?: FileHandle;
 }
 
@@ -1206,6 +1224,13 @@ async function quarantineRootControlDirectory(
     if (!(await containsOnlyDisposableRootControlEntries(controlDirectory))) {
       return { kind: 'skipped' };
     }
+    const directoryStatBeforeClaim = await lstatPathIfPresent(controlDirectory);
+    if (
+      directoryStatBeforeClaim === undefined ||
+      !sameFilesystemIdentity(initialDirectoryStat, directoryStatBeforeClaim)
+    ) {
+      return { kind: 'skipped' };
+    }
     await Promise.all([
       assertStableLockArtifact(ownerHandle, join(controlDirectory, 'owner.lock')),
       assertStableLockArtifact(writerHandle, join(controlDirectory, ARTIFACT_WRITER_LOCK_FILE)),
@@ -1225,6 +1250,19 @@ async function quarantineRootControlDirectory(
         join(controlDirectory, ARTIFACT_WRITER_LOCK_FILE),
       );
       if (!(await containsOnlyDisposableRootControlEntries(controlDirectory))) {
+        await closeReapLock(claimHandle);
+        await unlink(join(claimDirectory, ROOT_CONTROL_CLAIM_LOCK));
+        await rmdir(claimDirectory);
+        return { kind: 'skipped' };
+      }
+      const preRenameDirectoryStat = await lstatPathIfPresent(controlDirectory);
+      if (
+        input.minimumDirectoryAgeMs !== undefined &&
+        (preRenameDirectoryStat === undefined ||
+          !sameFilesystemIdentity(initialDirectoryStat, preRenameDirectoryStat) ||
+          (preRenameDirectoryStat.mtimeNs !== directoryStatBeforeClaim.mtimeNs &&
+            Date.now() - Number(preRenameDirectoryStat.mtimeMs) < input.minimumDirectoryAgeMs))
+      ) {
         await closeReapLock(claimHandle);
         await unlink(join(claimDirectory, ROOT_CONTROL_CLAIM_LOCK));
         await rmdir(claimDirectory);
