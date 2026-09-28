@@ -16,10 +16,10 @@ Locations intentionally omit line numbers so unrelated edits do not invalidate t
 | Classification | Count |
 |---|---:|
 | windows-backend-gap | 27 |
-| portable-candidate | 61 |
+| portable-candidate | 62 |
 | platform-contract | 41 |
 
-Total Windows-excluded declarations: **129**
+Total Windows-excluded declarations: **130**
 
 ## Inventory
 
@@ -115,6 +115,7 @@ Total Windows-excluded declarations: **129**
 | platform-contract | `packages/storage/src/__tests__/root-authority.test.ts` validates an existing control directory without repairing its permissions | `process.platform === 'win32'` |
 | portable-candidate | `packages/storage/src/__tests__/root-authority.test.ts` removes the disposable control directory when a write owner closes normally | `process.platform === 'win32' ? 'Windows may reject rename while lock handles are open' : false` |
 | portable-candidate | `packages/storage/src/__tests__/root-authority.test.ts` retries owner acquisition when a reaper renames the opened control directory | `process.platform === 'win32'` |
+| portable-candidate | `packages/storage/src/__tests__/root-authority.test.ts` retries owner acquisition when a reaper removes the control directory before open | `process.platform === 'win32'` |
 | portable-candidate | `packages/storage/src/__tests__/root-authority.test.ts` rechecks directory freshness immediately before quarantine rename | `process.platform === 'win32'` |
 | portable-candidate | `packages/storage/src/__tests__/root-authority.test.ts` reaps an old crash directory in full but preserves a directory inside the grace period | `process.platform === 'win32' ? 'Windows may reject rename while lock handles are open' : false` |
 | platform-contract | `packages/storage/src/__tests__/root-authority.test.ts` skips invalid names and symlinked root-control candidates | `process.platform === 'win32' ? 'Windows symlink permissions are not guaranteed in CI' : false` |

@@ -1035,13 +1035,15 @@ async function acquireStateRootLock<K extends StorageRootKind>(
         );
         break;
       } catch (error) {
-        // A stale-directory reaper can rename the compatibility lock after it
-        // is opened but before its identity is checked. The durable lock held
-        // above makes one retry safe and prevents two owners from emerging.
+        // A stale-directory reaper can remove the prepared directory before
+        // this open, or rename it after the lock is opened but before its
+        // identity is checked. The durable lock held above makes one retry
+        // safe and prevents two owners from emerging.
         if (
           attempt !== 0 ||
-          !(error instanceof StorageRootAuthorityError) ||
-          error.code !== 'invalid_lock_artifact'
+          (!isMissingPathError(error) &&
+            (!(error instanceof StorageRootAuthorityError) ||
+              error.code !== 'invalid_lock_artifact'))
         ) {
           throw error;
         }

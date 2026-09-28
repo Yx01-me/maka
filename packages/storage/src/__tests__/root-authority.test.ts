@@ -985,6 +985,61 @@ describe('storage root authority', () => {
     });
   });
 
+  test('retries owner acquisition when a reaper removes the control directory before open', {
+    skip: process.platform === 'win32',
+  }, async (context) => {
+    await withRoots(async ({ root }) => {
+      const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
+      const { controlDirectory } = await prepareStorageRootControlDirectory(capability);
+      await writeFile(join(controlDirectory, 'registration.json'), '{}\n');
+
+      const ownerLockPath = join(controlDirectory, 'owner.lock');
+      const originalOpen = filesystem.open;
+      let ownerLockOpenPending!: () => void;
+      const ownerLockOpenReached = new Promise<void>((resolve) => {
+        ownerLockOpenPending = resolve;
+      });
+      let resumeOwnerAcquisition!: () => void;
+      const ownerAcquisitionBlocked = new Promise<void>((resolve) => {
+        resumeOwnerAcquisition = resolve;
+      });
+      let paused = false;
+      context.mock.method(
+        filesystem,
+        'open',
+        async (...args: Parameters<typeof filesystem.open>) => {
+          if (String(args[0]) === ownerLockPath && !paused) {
+            paused = true;
+            ownerLockOpenPending();
+            await ownerAcquisitionBlocked;
+          }
+          return originalOpen(...args);
+        },
+      );
+      syncBuiltinESMExports();
+
+      let owner: Awaited<ReturnType<typeof tryAcquireInteractiveRootOwner>>;
+      try {
+        const acquiringOwner = tryAcquireInteractiveRootOwner(capability);
+        await ownerLockOpenReached;
+        const summary = await reapStaleRootControlDirectories({
+          graceMs: 0,
+          maxEntries: 100_000,
+        });
+        assert.equal(summary.reaped, 1);
+        resumeOwnerAcquisition();
+        owner = await acquiringOwner;
+        assert.ok(owner);
+        assert.equal((await lstat(owner.controlDirectory)).isDirectory(), true);
+      } finally {
+        resumeOwnerAcquisition();
+        context.mock.restoreAll();
+        syncBuiltinESMExports();
+        await owner?.close();
+      }
+    });
+  });
+
   test('rechecks directory freshness immediately before quarantine rename', {
     skip: process.platform === 'win32',
   }, async (context) => {
