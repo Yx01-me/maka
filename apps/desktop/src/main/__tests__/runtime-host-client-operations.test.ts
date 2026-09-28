@@ -445,13 +445,15 @@ test('treats empty configuration patches as read-only lookups', async () => {
   ]);
 });
 
-test('binds message controls to the current Host Epoch', async () => {
+test('binds every message command to the current Host Epoch', async () => {
   const { client, requests } = clientWithResponses([
     { disposition: 'steering', queueRevision: 2 },
     { queueRevision: 3 },
     { queueRevision: 4 },
+    { queueRevision: 5 },
+    { queueRevision: 6 },
     {
-      queueRevision: 5,
+      queueRevision: 7,
       retracted: [],
       turn: {
         sessionId: 'session-1',
@@ -475,12 +477,23 @@ test('binds message controls to the current Host Epoch', async () => {
     entryId: 'entry-1',
     retractId: 'retract-1',
   });
+  await client.promoteQueueEntry({
+    sessionId: 'session-1',
+    entryId: 'entry-2',
+    promoteId: 'promote-1',
+  });
   await client.updateQueueEntry({
     sessionId: 'session-1',
     entryId: 'entry-1',
     updateId: 'update-1',
     expectedQueueRevision: 3,
     text: 'Updated steer',
+  });
+  await client.reorderQueueEntries({
+    sessionId: 'session-1',
+    reorderId: 'reorder-1',
+    expectedQueueRevision: 5,
+    entryIds: ['entry-2', 'entry-1'],
   });
   await client.interruptTurn({
     sessionId: 'session-1',
@@ -510,6 +523,15 @@ test('binds message controls to the current Host Epoch', async () => {
       },
     },
     {
+      operation: 'queue.entry.promote',
+      input: {
+        sessionId: 'session-1',
+        entryId: 'entry-2',
+        promoteId: 'promote-1',
+        originHostEpoch: 'host-current',
+      },
+    },
+    {
       operation: 'queue.entry.update',
       input: {
         sessionId: 'session-1',
@@ -517,6 +539,16 @@ test('binds message controls to the current Host Epoch', async () => {
         updateId: 'update-1',
         expectedQueueRevision: 3,
         text: 'Updated steer',
+        originHostEpoch: 'host-current',
+      },
+    },
+    {
+      operation: 'queue.entries.reorder',
+      input: {
+        sessionId: 'session-1',
+        reorderId: 'reorder-1',
+        expectedQueueRevision: 5,
+        entryIds: ['entry-2', 'entry-1'],
         originHostEpoch: 'host-current',
       },
     },
@@ -904,6 +936,42 @@ interface RecordedRequest {
   operation: OperationKey;
   input: unknown;
 }
+
+test('a relocate conflict is reported, not replayed with a stale directory', async () => {
+  const { client, requests } = clientWithResponses([
+    {
+      kind: 'session',
+      session: session('session-1', 1, {
+        workspace: { target: { kind: 'host_path', path: '/old' }, hostCwd: '/old' },
+      }),
+    },
+    { kind: 'revision_conflict', expectedRevision: 1, actualRevision: 2 },
+  ]);
+
+  const current = await client.getSession('session-1');
+  assert.ok(current);
+  await assert.rejects(
+    () =>
+      client.relocateSessionWorkspace('session-1', current.revision, {
+        kind: 'host_path',
+        path: current.workspace.hostCwd,
+      }),
+    /kept changing during relocate/,
+  );
+
+  // One attempt, at the revision the directory was read from. A replay would
+  // commit `/old` under revision 2 — moving the Session back to a directory a
+  // concurrent writer had already left.
+  assert.deepEqual(
+    requests.map(({ operation }) => operation),
+    ['session.catalog.query', 'session.workspace.relocate'],
+  );
+  assert.deepEqual(requests[1]?.input, {
+    sessionId: 'session-1',
+    expectedRevision: 1,
+    workspace: { kind: 'host_path', path: '/old' },
+  });
+});
 
 function clientWithResponses(responses: unknown[]): {
   client: DesktopRuntimeHostClient;
