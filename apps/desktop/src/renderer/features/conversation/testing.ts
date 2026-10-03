@@ -18,13 +18,27 @@
  */
 
 import type { ConversationServices } from './ports.js';
+import { createSessionUiState, type AppShellSessionUiState } from './model/session-ui-state.js';
+
+export {
+  createAppShellSessionUiStateController as createProductionSessionUiStateController,
+  clearAppShellSessionUiStateForSession,
+  createInitialAppShellSessionUiState,
+  type AppShellSessionUiState,
+} from './model/session-ui-state.js';
+
+/** Production controller with inspection available only to tests. */
+export function createAppShellSessionUiStateController(initialState?: AppShellSessionUiState) {
+  const { controller, getState } = createSessionUiState(initialState);
+  return { ...controller, getState };
+}
 
 export {
   createTranscriptRestoreLifecycle,
   prepareTranscriptForSend,
   restoreSessionTranscriptRange,
 } from './controller/transcript-reading-position.js';
-export { shellSessionRowEqual } from './controller/use-app-shell-session-ui-state.js';
+export { shellSessionRowEqual } from './model/conversation-catalog-row.js';
 export {
   type ActiveExecutionBoundarySnapshot,
   activeExecutionBoundaryOf,
@@ -41,12 +55,22 @@ export function stubConversationServices(
 ): ConversationServices {
   const { sessions, ...rest } = overrides;
   return {
+    observation: { openTranscript() { throw new Error('Transcript observation not configured'); }, subscribeEvents: () => () => {}, listActiveInteractions: async () => [], subscribeActiveInteractions: () => () => {}, shellRuns: { list: async () => [], subscribeUpdates: () => () => {}, subscribeResync: () => () => {} }, subscribeVisible: () => () => {}, queryCancelledMessages: async () => ({ cancelledMessageIds: [] }) },
     listMessages: async () => [],
     cancelMessage: async () => undefined,
     reconcileMessage: async () => undefined,
     subscribeChanges: () => () => undefined,
     skills: { listInvocable: async () => [] },
     runtimeHosts: { subscribeChanges: () => () => undefined },
+    resume: {
+      queryPlan: async () => {
+        throw new Error('Resume plan query is not stubbed');
+      },
+      start: async () => {
+        throw new Error('Resume start is not stubbed');
+      },
+      subscribeChanges: () => () => undefined,
+    },
     workspace: { searchFiles: async () => ({ ok: false, reason: 'no_project' }) },
     newTasks: {
       subscribeChanges: () => () => undefined,
@@ -66,7 +90,52 @@ export function stubConversationServices(
       retractQueueEntry: async () => undefined,
       updateQueueEntry: async () => undefined,
       reorderQueueEntries: async () => undefined,
+      compact: async () => {
+        throw new Error('Context compaction is not stubbed');
+      },
+      listTurnLandmarks: async () => ({ landmarks: [] }),
       ...sessions,
     },
   };
 }
+
+export { usePlanModeState } from './controller/use-plan-mode-state.js';
+export type { PlanModeState } from './model/plan-state.js';
+export { PlanExecutionPanel } from './ui/plan-panels.js';
+
+export { createSessionWorkspaceActions } from './model/session-workspace-actions.js';
+
+export { createAppShellSessionDisplayBatch, createAppShellSessionEventHandlers } from './model/session-events.js';
+export { createConversationWorkspace } from './model/conversation-workspace.js';
+export { useConversationOwner } from './ui/conversation-context.js';
+
+export { createTranscriptCommands } from './model/transcript-commands.js';
+export {
+  contextCompactionNotice,
+  createContextCompactionCommands,
+  createContextCompactionPresentation,
+  presentContextCompactionResult,
+} from './model/context-compaction.js';
+export { useConversationQueue } from './ui/conversation-provider.js';
+
+export { LiveTurnReconciler } from './controller/live-turn-reconciler.js';
+export { TranscriptReadingPositionController, type TranscriptReadingPositionCommands } from './controller/transcript-reading-position-controller.js';
+export { useComposerAttachments } from './controller/use-composer-attachments.js';
+export { useComposerQuotes } from './controller/use-composer-quotes.js';
+export { useComposerStaging } from './ui/composer-staging-context.js';
+export { deriveTaskReadinessNotice, isTaskSubmissionHardBlocked } from './model/task-readiness-notice.js';
+export { mergeWorkspaceReferences, rebaseWorkspaceFileReferences } from './model/follow-up-submit-routing.js';
+export { createChatActions } from './controller/chat-actions.js';
+export {
+  completeTurnRevisionCopyAttempt,
+  createRevisionActions,
+  type TurnRevisionDraft,
+} from './controller/revision-actions.js';
+export {
+  createRevisionAwareOnSend,
+  createStagedFollowUp,
+  type RevisionSendPorts,
+} from './controller/composer-submit.js';
+export { SessionLocalMessages } from './controller/session-local-messages.js';
+export { createStopAction } from './controller/stop-action.js';
+export { createTurnActions } from './controller/turn-actions.js';

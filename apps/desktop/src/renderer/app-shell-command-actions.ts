@@ -30,7 +30,8 @@ import {
   runOnDefaultRuntimeHost,
 } from './platform/desktop/default-runtime-host-operation.js';
 import { buildCommandList } from "./command-palette-commands.js";
-import type { Command } from './features/overlays/index.js';
+import type { CopyManualDiagnosticReport } from './features/diagnostics/index.js';
+import type { Command, OverlayPaletteActions } from './features/overlays/index.js';
 import type { SessionCatalogController } from './application/contracts/session-catalog/session-catalog-state.js';
 import { renderConversationMarkdown } from "./conversation-markdown.js";
 import {
@@ -68,7 +69,7 @@ export interface AppShellCommandListOptions {
   clientPathsAccessible: boolean;
   connections: LlmConnection[];
   defaultConnection: string | null;
-  messages: StoredMessage[];
+  readMessages(): readonly StoredMessage[];
   newTaskProfileId: string | undefined;
   settingsOpen: boolean;
   settingsProfileId: string | undefined;
@@ -77,6 +78,9 @@ export interface AppShellCommandListOptions {
   /** Sessions the rail hides (mounted side-chat forks) — the palette skips them too. */
   hiddenSessionIds: ReadonlySet<string>;
   captureComposerImportOwner: () => ComposerImportOwner;
+  copyManualDiagnosticReport: CopyManualDiagnosticReport;
+  /** The overlays owner's Desktop operations for the rows below. */
+  paletteActions: OverlayPaletteActions;
   createSession: () => void;
   openSideConversation: () => void;
   openHelp: () => void;
@@ -146,10 +150,10 @@ export function buildAppShellCommandList(
     onOpenShortcuts: () => optionsRef.current.openHelp(),
     onSetTheme: (next) => optionsRef.current.setThemePref(next),
     onTestConnection: async (slug) => {
-      const { connections, refreshConnections, toastApi } = optionsRef.current;
+      const { connections, paletteActions, refreshConnections, toastApi } = optionsRef.current;
       try {
         const { value: result, diagnosticTarget } = await runOnDefaultRuntimeHost((host) =>
-          window.maka.connections.test(slug, undefined, host),
+          paletteActions.testConnection(slug, host),
         );
         const conn = connections.find((c) => c.slug === slug);
         const name = conn?.name ?? slug;
@@ -184,10 +188,10 @@ export function buildAppShellCommandList(
       }
     },
     onSetDefaultConnection: async (slug) => {
-      const { connections, refreshConnections, toastApi } = optionsRef.current;
+      const { connections, paletteActions, refreshConnections, toastApi } = optionsRef.current;
       try {
         await runOnDefaultRuntimeHost((host) =>
-          window.maka.connections.setDefault(slug, host),
+          paletteActions.setDefaultConnection(slug, host),
         );
         await refreshConnections();
         const conn = connections.find((c) => c.slug === slug);
@@ -205,24 +209,20 @@ export function buildAppShellCommandList(
         );
       }
     },
-    onOpenWorkspace: async () => {
-      await optionsRef.current.openWorkspaceFolder();
-    },
+    onOpenWorkspace: () => optionsRef.current.openWorkspaceFolder(),
     ...(options.clientPathsAccessible
       ? {
           onOpenProjectFolder: () => optionsRef.current.openProjectFolder(),
         }
       : {}),
-    onSelectModule: (selection) => {
-      optionsRef.current.setNavSelection(selection);
-    },
+    onSelectModule: (selection) => optionsRef.current.setNavSelection(selection),
     onExportActiveConversation: async () => {
-      const { activeId, messages, sessionCatalog, toastApi } = optionsRef.current;
+      const { activeId, readMessages, sessionCatalog, toastApi } = optionsRef.current;
       if (!activeId) return;
       const session = sessionCatalog.getState().sessions.find((s) => s.id === activeId);
       const markdown = renderConversationMarkdown(
         session?.name ?? copy.newConversation,
-        messages,
+        readMessages(),
         locale,
       );
       try {
@@ -236,13 +236,13 @@ export function buildAppShellCommandList(
       }
     },
     onSaveActiveConversationToFile: async () => {
-      const { activeId, messages, sessionCatalog, toastApi } = optionsRef.current;
+      const { activeId, paletteActions, readMessages, sessionCatalog, toastApi } = optionsRef.current;
       if (!activeId) return;
       const session = sessionCatalog.getState().sessions.find((s) => s.id === activeId);
       const sessionName = session?.name ?? copy.newConversation;
       const markdown = renderConversationMarkdown(
         sessionName,
-        messages,
+        readMessages(),
         locale,
       );
       const now = new Date();
@@ -257,7 +257,7 @@ export function buildAppShellCommandList(
         .slice(0, 80);
       const defaultName = `maka-${sanitizedSession}-${yyyy}-${mm}-${dd}.md`;
       try {
-        const result = await window.maka.sessions.saveConversationToFile({
+        const result = await paletteActions.saveConversationToFile({
           markdown,
           defaultName,
         });
@@ -285,10 +285,10 @@ export function buildAppShellCommandList(
       }
     },
     onOpenLocalMemoryFile: async () => {
-      const { toastApi } = optionsRef.current;
+      const { paletteActions, toastApi } = optionsRef.current;
       try {
         const { value: result, diagnosticTarget } = await runOnDefaultRuntimeHost((host) =>
-          window.maka.memory.openFile(host),
+          paletteActions.openLocalMemoryFile(host),
         );
         if (!result.ok) {
           toastApi.error(
@@ -323,6 +323,7 @@ export function buildAppShellCommandList(
     onCopyDiagnostics: async () => {
       const {
         captureComposerImportOwner,
+        copyManualDiagnosticReport,
         newTaskProfileId,
         settingsOpen,
         settingsProfileId,
@@ -336,10 +337,7 @@ export function buildAppShellCommandList(
         settingsProfileId,
       );
       try {
-        await window.maka.diagnostics.copyReport({
-          surface: "manual",
-          ...(target ? { target } : {}),
-        });
+        await copyManualDiagnosticReport(target);
         toastApi.success(copy.diagnosticsCopiedTitle, copy.diagnosticsCopiedDescription);
       } catch (err) {
         toastApi.error(
@@ -355,15 +353,15 @@ export function buildAppShellCommandList(
       }
     },
     onTestNetworkProxy: async () => {
-      const { toastApi } = optionsRef.current;
+      const { paletteActions, toastApi } = optionsRef.current;
       try {
         // PR-CMD-PALETTE-NETWORK-PROXY-TEST-0: surface the
         // proxy test result via toast so a user debugging a
         // connection issue does not need to open Settings →
-        // 网络. `testNetworkProxy(undefined)` uses the
-        // current persisted proxy config.
+        // 网络. `testNetworkProxy` uses the current persisted
+        // proxy config.
         const { value: result, diagnosticTarget } = await runOnDefaultRuntimeHost((host) =>
-          window.maka.settings.testNetworkProxy(undefined, host),
+          paletteActions.testNetworkProxy(host),
         );
         const message = settingsTestResultMessage(result, locale);
         if (result.ok) {
