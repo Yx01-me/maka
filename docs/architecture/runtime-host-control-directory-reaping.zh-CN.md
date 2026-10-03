@@ -100,6 +100,8 @@ Artifact Writer 可以在没有 Runtime Host write owner 的情况下工作。�
 
 正常关闭路径已经持有 write owner 的 `owner.lock`。该路径复用并重新验证已有 handle，只额外获取 Writer lock；它不会再次打开同一个 owner lock 与自己竞争。后台 reaper 没有预持有锁，因此自行获取两个锁。
 
+Candidate 先取得 durable owner lock，再取得兼容 `owner.lock`。此时兼容锁冲突可能来自仍在运行、只认识旧锁的 Host，也可能来自已经取得双锁、即将完成 quarantine 的短暂 reaper。Candidate 因此以 25ms 间隔最多额外重试 4 次；reaper 可以在最多 100ms 的窗口内完成，而持续持锁的旧 Host 仍会让 Candidate 判定为 loser，不会被无限等待绕过。
+
 ## 4. Quarantine 协议
 
 ### 4.1 算法
@@ -135,6 +137,7 @@ validate <rootId> direct child
 - claim 分配期间若目录 mtime 被其他活动刷新且重新落入 grace，放弃本次 quarantine；基线在 reaper 创建锁文件后采集，避免把自身写入误判成 Host 活动；
 - 任何未知顶层文件或目录都使本轮跳过，不会进入 claim 删除；
 - claim 使用 UUID v4；`mkdir` 遇到 `EEXIST` 时重新生成，最多尝试 3 次。
+- source rename 以 `ENOENT`、`EBUSY` 或 `EPERM` 失败时，claim 仍只包含已关闭的 `.claim.lock`；本轮立即删除该锁和空 claim 目录，不把一次未发生的 quarantine 留作 24 小时后的 tombstone。
 
 ### 4.2 rename 后的名字
 
@@ -206,6 +209,8 @@ sequenceDiagram
 清理异常被隔离在 shutdown 的 best-effort 分支内。原有锁关闭错误仍然按照既有行为聚合并报告，不能被目录清理错误掩盖。
 
 Candidate 在取得 owner 后启动失败时，owner 可能先清除只有临时条目的目录。随后启动诊断写入会验证 rootId，并重建私有的诊断父目录，避免因 `ENOENT` 丢失失败原因。
+
+启动诊断是一次 Candidate 失败与随后 Client 观察之间的临时交接文件，不是持久故障日志。下一次成功取得 write owner 后的正常关闭或后台 sweep 可以删除它；Client 必须在发起下一轮会获取并释放 owner 的探测前读取当前诊断。需要跨成功启动长期保留的故障证据应进入独立日志或 telemetry authority，而不能依赖此控制目录文件。
 
 正常关闭的 tombstone 删除同样受 1,024 个工作事件 / 500ms 协作式预算限制。超过预算时释放 claim lock，保留部分 tombstone，后续回收继续处理。成功隔离后原始 `<rootId>` 已经移走。包含持久状态或未知条目、quarantine 失败或 Writer 活跃时，原目录会保留。
 

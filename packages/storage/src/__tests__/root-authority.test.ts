@@ -40,6 +40,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { describe, test } from 'node:test';
+import { tryLock, unlock } from 'fs-native-extensions';
 import { withArtifactWriterLock } from '../artifact-writer-lock.js';
 import {
   adoptStorageRootOnImport,
@@ -1040,6 +1041,133 @@ describe('storage root authority', () => {
     });
   });
 
+  test('retries owner acquisition while a reaper holds the compatibility lock', async (context) => {
+    await withRoots(async ({ root }) => {
+      const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
+      const { controlRoot, controlDirectory } =
+        await prepareStorageRootControlDirectory(capability);
+      await writeFile(join(controlDirectory, 'registration.json'), '{}\n');
+
+      const reapRoot = join(controlRoot, '.reap');
+      const ownerLockPath = join(controlDirectory, 'owner.lock');
+      const originalMkdir = filesystem.mkdir;
+      const originalOpen = filesystem.open;
+      let reaperHoldingOwnerLock!: () => void;
+      const reaperReachedClaim = new Promise<void>((resolve) => {
+        reaperHoldingOwnerLock = resolve;
+      });
+      let resumeReaper!: () => void;
+      const reaperBlocked = new Promise<void>((resolve) => {
+        resumeReaper = resolve;
+      });
+      let candidateObservedBusy!: () => void;
+      const candidateLockWasBusy = new Promise<void>((resolve) => {
+        candidateObservedBusy = resolve;
+      });
+      let resumeCandidateClose!: () => void;
+      const candidateCloseBlocked = new Promise<void>((resolve) => {
+        resumeCandidateClose = resolve;
+      });
+      let claimPaused = false;
+      let ownerLockOpens = 0;
+      context.mock.method(
+        filesystem,
+        'mkdir',
+        async (...args: Parameters<typeof filesystem.mkdir>) => {
+          const result = await originalMkdir(...args);
+          if (dirname(String(args[0])) === reapRoot && !claimPaused) {
+            claimPaused = true;
+            reaperHoldingOwnerLock();
+            await reaperBlocked;
+          }
+          return result;
+        },
+      );
+      context.mock.method(
+        filesystem,
+        'open',
+        async (...args: Parameters<typeof filesystem.open>) => {
+          const handle = await originalOpen(...args);
+          if (String(args[0]) === ownerLockPath) {
+            ownerLockOpens += 1;
+            if (ownerLockOpens === 2) {
+              const originalClose = handle.close.bind(handle);
+              context.mock.method(handle, 'close', async () => {
+                candidateObservedBusy();
+                await candidateCloseBlocked;
+                await originalClose();
+              });
+            }
+          }
+          return handle;
+        },
+      );
+      syncBuiltinESMExports();
+
+      let owner: Awaited<ReturnType<typeof tryAcquireInteractiveRootOwner>>;
+      let acquiringOwner: ReturnType<typeof tryAcquireInteractiveRootOwner> | undefined;
+      try {
+        const reaping = reapStaleRootControlDirectories({
+          graceMs: 0,
+          maxEntries: 100_000,
+        });
+        await reaperReachedClaim;
+        acquiringOwner = tryAcquireInteractiveRootOwner(capability);
+        await candidateLockWasBusy;
+        resumeReaper();
+        const summary = await reaping;
+        assert.equal(summary.failed, 0);
+        assert.ok(summary.reaped + summary.busy >= 1);
+        resumeCandidateClose();
+        owner = await acquiringOwner;
+        assert.ok(owner);
+        assert.equal(ownerLockOpens, 3);
+      } finally {
+        resumeReaper();
+        resumeCandidateClose();
+        await acquiringOwner?.catch(() => undefined);
+        context.mock.restoreAll();
+        syncBuiltinESMExports();
+        await owner?.close();
+      }
+    });
+  });
+
+  test('bounds compatibility-lock retries when a legacy owner remains active', async (context) => {
+    await withRoots(async ({ root }) => {
+      const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
+      const { controlDirectory } = await prepareStorageRootControlDirectory(capability);
+      const ownerLockPath = join(controlDirectory, 'owner.lock');
+      const legacyHandle = await filesystem.open(ownerLockPath, 'a+', 0o600);
+      assert.equal(tryLock(legacyHandle.fd), true);
+
+      const originalOpen = filesystem.open;
+      let ownerLockOpens = 0;
+      context.mock.method(
+        filesystem,
+        'open',
+        async (...args: Parameters<typeof filesystem.open>) => {
+          if (String(args[0]) === ownerLockPath) ownerLockOpens += 1;
+          return originalOpen(...args);
+        },
+      );
+      syncBuiltinESMExports();
+      try {
+        assert.equal(await tryAcquireInteractiveRootOwner(capability), undefined);
+        assert.equal(ownerLockOpens, 5);
+      } finally {
+        context.mock.restoreAll();
+        syncBuiltinESMExports();
+        unlock(legacyHandle.fd);
+        await legacyHandle.close();
+      }
+
+      const successor = await tryAcquireInteractiveRootOwner(capability);
+      assert.ok(successor);
+      await successor?.close();
+    });
+  });
+
   test('rechecks directory freshness immediately before quarantine rename', {
     skip: process.platform === 'win32',
   }, async (context) => {
@@ -1078,6 +1206,43 @@ describe('storage root authority', () => {
         assert.equal(refreshed, true);
         assert.equal(summary.reaped, 0);
         assert.ok(summary.skipped >= 1);
+        assert.equal((await lstat(controlDirectory)).isDirectory(), true);
+      } finally {
+        context.mock.restoreAll();
+        syncBuiltinESMExports();
+      }
+    });
+  });
+
+  test('removes an empty reap claim when quarantine rename is unavailable', async (context) => {
+    await withRoots(async ({ root }) => {
+      const capability = await resolveStorageRoot({ path: root, kind: 'interactive' });
+      const { controlRoot, controlDirectory } =
+        await prepareStorageRootControlDirectory(capability);
+      await writeFile(join(controlDirectory, 'registration.json'), '{}\n');
+
+      const originalRename = filesystem.rename;
+      let renameFailed = false;
+      context.mock.method(
+        filesystem,
+        'rename',
+        async (...args: Parameters<typeof filesystem.rename>) => {
+          if (String(args[0]) === controlDirectory) {
+            renameFailed = true;
+            throw Object.assign(new Error('rename unavailable'), { code: 'EPERM' });
+          }
+          return originalRename(...args);
+        },
+      );
+      syncBuiltinESMExports();
+      try {
+        const summary = await reapStaleRootControlDirectories({
+          graceMs: 0,
+          maxEntries: 100_000,
+        });
+        assert.equal(renameFailed, true);
+        assert.ok(summary.busy >= 1);
+        assert.deepEqual(await readdir(join(controlRoot, '.reap')), []);
         assert.equal((await lstat(controlDirectory)).isDirectory(), true);
       } finally {
         context.mock.restoreAll();

@@ -52,6 +52,8 @@ const ROOT_CONTROL_REAP_MAX_ENTRIES = 1_024;
 const ROOT_CONTROL_REAP_MAX_DURATION_MS = 500;
 const ROOT_CONTROL_REAP_CLAIM_RETRIES = 3;
 const ROOT_CONTROL_CLAIM_LOCK = '.claim.lock';
+const ROOT_CONTROL_COMPATIBILITY_LOCK_BUSY_RETRIES = 4;
+const ROOT_CONTROL_COMPATIBILITY_LOCK_RETRY_DELAY_MS = 25;
 
 export type StorageRootKind = 'interactive';
 export type StorageRootAccess = 'read' | 'write';
@@ -1025,28 +1027,39 @@ async function acquireStateRootLock<K extends StorageRootKind>(
 
   let compatibilityHandle: FileHandle | undefined;
   let controlDirectory: string;
+  let replacementRetries = 0;
+  let busyRetries = 0;
   try {
-    for (let attempt = 0; ; attempt += 1) {
+    for (;;) {
       ({ controlDirectory } = await prepareStorageRootControlDirectory(capability));
       try {
         compatibilityHandle = await tryAcquireStableRootLock(
           join(controlDirectory, 'owner.lock'),
           access,
         );
-        break;
+        if (compatibilityHandle) break;
+        // Holding the durable lock rules out a current owner, but a reaper can
+        // briefly hold the compatibility lock while it quarantines stale state.
+        // Bound the wait so an older owner that only knows this lock still wins.
+        if (busyRetries >= ROOT_CONTROL_COMPATIBILITY_LOCK_BUSY_RETRIES) break;
+        busyRetries += 1;
+        await new Promise<void>((resolve) =>
+          setTimeout(resolve, ROOT_CONTROL_COMPATIBILITY_LOCK_RETRY_DELAY_MS),
+        );
       } catch (error) {
         // A stale-directory reaper can remove the prepared directory before
         // this open, or rename it after the lock is opened but before its
         // identity is checked. The durable lock held above makes one retry
         // safe and prevents two owners from emerging.
         if (
-          attempt !== 0 ||
+          replacementRetries !== 0 ||
           (!isMissingPathError(error) &&
             (!(error instanceof StorageRootAuthorityError) ||
               error.code !== 'invalid_lock_artifact'))
         ) {
           throw error;
         }
+        replacementRetries += 1;
       }
     }
     if (!compatibilityHandle) {
@@ -1252,9 +1265,7 @@ async function quarantineRootControlDirectory(
         join(controlDirectory, ARTIFACT_WRITER_LOCK_FILE),
       );
       if (!(await containsOnlyDisposableRootControlEntries(controlDirectory))) {
-        await closeReapLock(claimHandle);
-        await unlink(join(claimDirectory, ROOT_CONTROL_CLAIM_LOCK));
-        await rmdir(claimDirectory);
+        await removeEmptyRootControlReapClaim(claimDirectory, claimHandle);
         return { kind: 'skipped' };
       }
       const preRenameDirectoryStat = await lstatPathIfPresent(controlDirectory);
@@ -1265,17 +1276,16 @@ async function quarantineRootControlDirectory(
           (preRenameDirectoryStat.mtimeNs !== directoryStatBeforeClaim.mtimeNs &&
             Date.now() - Number(preRenameDirectoryStat.mtimeMs) < input.minimumDirectoryAgeMs))
       ) {
-        await closeReapLock(claimHandle);
-        await unlink(join(claimDirectory, ROOT_CONTROL_CLAIM_LOCK));
-        await rmdir(claimDirectory);
+        await removeEmptyRootControlReapClaim(claimDirectory, claimHandle);
         return { kind: 'skipped' };
       }
       await rename(controlDirectory, join(claimDirectory, input.rootId));
     } catch (error) {
-      await closeReapLock(claimHandle);
       if (isMissingPathError(error) || isNodeError(error, 'EBUSY') || isNodeError(error, 'EPERM')) {
+        await removeEmptyRootControlReapClaim(claimDirectory, claimHandle);
         return isMissingPathError(error) ? { kind: 'skipped' } : { kind: 'busy' };
       }
+      await closeReapLock(claimHandle);
       throw error;
     }
     return { kind: 'quarantined', claimDirectory, claimHandle };
@@ -1342,6 +1352,15 @@ async function createRootControlReapClaim(controlRoot: string): Promise<string> 
 async function closeReapLock(handle: FileHandle): Promise<void> {
   releaseLock(handle);
   await handle.close().catch(() => undefined);
+}
+
+async function removeEmptyRootControlReapClaim(
+  claimDirectory: string,
+  claimHandle: FileHandle,
+): Promise<void> {
+  await closeReapLock(claimHandle);
+  await unlink(join(claimDirectory, ROOT_CONTROL_CLAIM_LOCK));
+  await rmdir(claimDirectory);
 }
 
 async function assertDirectoryIdentity(path: string, expected: BigIntStats): Promise<void> {
